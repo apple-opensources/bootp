@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 1999 - 2004 Apple Computer, Inc. All rights reserved.
+ * Copyright (c) 1999-2006 Apple Computer, Inc. All rights reserved.
  *
  * @APPLE_LICENSE_HEADER_START@
  * 
@@ -22,7 +22,7 @@
  */
 
 /*
- * bsdpd.m
+ * bsdpd.c
  * - NetBoot Server implementing Boot Server Discovery Protocol (BSDP)
  */
 
@@ -68,8 +68,7 @@
 #include <pwd.h>
 #include <grp.h>
 
-#import "subnetDescr.h"
-
+#include "subnets.h"
 #include "afp.h"
 #include "bsdp.h"
 #include "bsdplib.h"
@@ -80,7 +79,6 @@
 #include "bootp_transmit.h"
 #include "netinfo.h"
 #include "bsdpd.h"
-#include "NIDomain.h"
 #include "bootpd.h"
 #include "macNC.h"
 #include "macnc_options.h"
@@ -90,6 +88,10 @@
 #include "NICachePrivate.h"
 #include "AFPUsers.h"
 #include "NetBootServer.h"
+#include "bootpd-plist.h"
+#include "cfutil.h"
+#include <SystemConfiguration/SCPrivate.h>
+#include <SystemConfiguration/SCValidation.h>
 
 #define ARCH_PPC			"ppc"
 
@@ -112,23 +114,22 @@ typedef struct {
 /* global variables */
 gid_t			G_admin_gid = 0;
 boolean_t		G_disk_space_warned = FALSE;
-u_long			G_shadow_size_meg = SHADOW_SIZE_DEFAULT;
+uint32_t		G_shadow_size_meg = SHADOW_SIZE_DEFAULT;
 NBSPListRef		G_client_sharepoints = NULL;
 NBImageListRef		G_image_list = NULL;
 
 /* local variables */
-u_int32_t		S_age_time_seconds = AGE_TIME_SECONDS;
+static uint32_t		S_age_time_seconds = AGE_TIME_SECONDS;
 static gid_t		S_netboot_gid;
 static BSDPClients_t	S_clients;
-static AFPUsers_t	S_afp_users;
-static int		S_afp_users_max = AFP_USERS_MAX;
+static AFPUserList	S_afp_users;
+static uint32_t		S_afp_users_max = AFP_USERS_MAX;
 static NBSPListRef	S_sharepoints = NULL;
 static char *		S_machine_name_format = DEFAULT_MACHINE_NAME_FORMAT;
 
 #define AFP_UID_START	100
-static int		S_afp_uid_start = AFP_UID_START;
+static uint32_t		S_afp_uid_start = AFP_UID_START;
 static int		S_next_host_number = 0;
-static PropList_t 	S_config_netboot;
 
 void
 BSDPClients_free(BSDPClients_t * clients)
@@ -179,94 +180,116 @@ S_host_number_max()
 }
 
 static boolean_t
-S_gid_taken(ni_entrylist * id_list, gid_t gid)
+S_gid_taken(ODNodeRef node, CFStringRef gid)
 {
-    int 		i;
+    CFErrorRef	error;
+    boolean_t	taken	= FALSE;
+    ODQueryRef	query;
+    CFArrayRef	results;
 
-    for (i = 0; i < id_list->niel_len; i++) {
-	ni_namelist * 	nl_p = id_list->niel_val[i].names;
-	gid_t		group_id;
-
-	if (nl_p == NULL || nl_p->ninl_len == 0)
-	    continue;
-
-	group_id = strtoul(nl_p->ninl_val[0], NULL, 0);
-	if (group_id == gid)
-	    return (TRUE);
+    query = ODQueryCreateWithNode(NULL,
+				  node,					// inNode
+				  CFSTR(kDSStdRecordTypeGroups),	// inRecordTypeOrList
+				  CFSTR(kDS1AttrPrimaryGroupID),	// inAttribute
+				  kODMatchEqualTo,			// inMatchType
+				  gid,					// inQueryValueOrList
+				  NULL,					// inReturnAttributeOrList
+				  0,					// inMaxResults
+				  &error);
+    if (query == NULL) {
+	my_log(LOG_INFO, "bsdpd : S_gid_taken : ODQueryCreateWithNode() failed");
+	my_CFRelease(&error);
+	goto failed;
     }
-    return (FALSE);
+
+    results = ODQueryCopyResults(query, FALSE, &error);
+    CFRelease(query);
+    if (results == NULL) {
+	my_log(LOG_INFO, "bsdpd : S_gid_taken : ODQueryCopyResults() failed");
+	my_CFRelease(&error);
+	goto failed;
+    }
+
+    if (CFArrayGetCount(results) > 0) {
+	taken = TRUE;
+    }
+    CFRelease(results);
+
+ failed:
+    return (taken);
 }
 
 static boolean_t
 S_create_netboot_group(gid_t preferred_gid, gid_t * actual_gid)
 {
-    ni_id		dir;
-    ni_entrylist	id_list;
-    ni_proplist		pl;
-    boolean_t		ret = FALSE;
-    ni_status		status;
-    gid_t		scan;
+    CFErrorRef	error	= NULL;
+    ODNodeRef	node;
+    boolean_t	ret	= FALSE;
+    gid_t	scan;
 
-    *actual_gid = 0;
-    NI_INIT(&id_list);
-    NI_INIT(&pl);
-
-    status = ni_pathsearch(NIDomain_handle(ni_local), &dir,
-			   NIDIR_GROUPS);
-    if (status != NI_OK) {
-	my_log(LOG_INFO, "bsdpd: ni_pathsearch '%s' failed, %s",
-	       NIDIR_GROUPS, ni_error(status));
+    node = ODNodeCreateWithNodeType(NULL, kODSessionDefault, kODTypeLocalNode, &error);
+    if (node == NULL) {
+	my_log(LOG_INFO, "bsdpd : S_create_netboot_group : ODNodeCreateWithNodeType() failed");
 	return (FALSE);
     }
-    status = ni_list(NIDomain_handle(ni_local), &dir,
-		     NIPROP_GID, &id_list);
-    if (status != NI_OK) {
-	my_log(LOG_INFO, "bsdpd: ni_list '%s' failed, %s",
-	       NIDIR_GROUPS, ni_error(status));
-	return (FALSE);
-    }
-    
-    ni_set_prop(&pl, NIPROP_NAME, NETBOOT_GROUP, NULL);
-    ni_set_prop(&pl, NIPROP_PASSWD, "*", NULL);
 
-    for (scan = preferred_gid; TRUE; scan++) {
-	char		buf[64];
-	ni_id		child;
+    for (scan = preferred_gid; !ret; scan++) {
+	CFMutableDictionaryRef	attributes;
+	char			buf[64];
+	ODRecordRef		record	= NULL;
+	CFStringRef		gidStr;
 
-	if (S_gid_taken(&id_list, scan)) {
-	    continue;
-	}
 	snprintf(buf, sizeof(buf), "%d", scan);
-	ni_set_prop(&pl, NIPROP_GID, buf, NULL);
-	{
-	    int		i;
-#define MAX_RETRY		5
-	    for (i = 0; i < MAX_RETRY; i++) {
-		status = ni_create(NIDomain_handle(ni_local), 
-				   &dir, pl, &child, NI_INDEX_NULL);
-		if (status == NI_STALE) {
-		    ni_self(NIDomain_handle(ni_local),
-			    &dir);
-		    continue;
-		}
-		*actual_gid = scan;
-		ret = TRUE;
-		goto done;
-	    }
+	gidStr = CFStringCreateWithCString(NULL, buf, kCFStringEncodingASCII);
+	if (S_gid_taken(node, gidStr)) {
+	    goto nextGid;
 	}
 
-	if (status != NI_OK) {
-	    my_log(LOG_INFO, "bsdpd: create " NETBOOT_GROUP 
-		   " group failed, %s", ni_error(status));
+	attributes = CFDictionaryCreateMutable(NULL, 0,
+					       &kCFTypeDictionaryKeyCallBacks,
+					       &kCFTypeDictionaryValueCallBacks);
+	CFDictionarySetValue(attributes, CFSTR(kDS1AttrPassword), CFSTR("*"));
+      { // rdar://4759893
+	CFMutableArrayRef	array;
+	array = CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+	CFArrayAppendValue(array, CFSTR("*"));
+	CFDictionarySetValue(attributes, CFSTR(kDS1AttrPassword), array);
+	CFRelease(array);
+      }
+	CFDictionarySetValue(attributes, CFSTR(kDS1AttrPrimaryGroupID), gidStr);
+
+	record = ODNodeCreateRecord(node,				// inNode
+				    CFSTR(kDSStdRecordTypeGroups),	// inRecordType
+				    CFSTR(NETBOOT_GROUP),		// inRecordName
+				    attributes,				// inAttributes
+				    &error);
+	CFRelease(attributes);
+	if (record == NULL) {
+	    my_log(LOG_INFO,
+		   "bsdpd : S_create_netboot_group : ODNodeCreateRecord() failed");
+	    goto done;
+	}
+
+	if (!ODRecordSynchronize(record, &error)) {
+	    my_log(LOG_INFO,
+		   "bsdpd : S_create_netboot_group : ODRecordSynchronize() failed");
+	    goto done;
+	}
+
+	ret = TRUE;
+
+     nextGid:
+	my_CFRelease(&record);
+	my_CFRelease(&gidStr);
+	if (error != NULL) {
+	    my_CFRelease(&error);
 	    goto done;
 	}
     }
 
  done:
-    ni_proplist_free(&pl);
-    ni_entrylist_free(&id_list);
+    my_CFRelease(&node);
     return (ret);
-
 }
 
 static boolean_t
@@ -284,9 +307,9 @@ S_host_format_valid(const char * format)
 }
 
 static void
-S_read_config()
+S_read_config(CFDictionaryRef plist)
 {
-    ni_namelist *	nl_p;
+    CFTypeRef		prop;
 
     my_log(LOG_INFO, "bsdpd: re-reading configuration");
 
@@ -294,28 +317,37 @@ S_read_config()
     S_afp_users_max = AFP_USERS_MAX;
     S_afp_uid_start = AFP_UID_START;
     S_age_time_seconds = AGE_TIME_SECONDS;
+    if (S_machine_name_format != DEFAULT_MACHINE_NAME_FORMAT) {
+	free(S_machine_name_format);
+    }
     S_machine_name_format = DEFAULT_MACHINE_NAME_FORMAT;
 
-    if (PropList_read(&S_config_netboot) == TRUE) {
-	nl_p = PropList_lookup(&S_config_netboot, CFGPROP_SHADOW_SIZE_MEG);
-	if (nl_p && nl_p->ninl_len) {
-	    G_shadow_size_meg = strtol(nl_p->ninl_val[0], 0, 0);
-	}
-	nl_p = PropList_lookup(&S_config_netboot, CFGPROP_AFP_USERS_MAX);
-	if (nl_p && nl_p->ninl_len) {
-	    S_afp_users_max = strtol(nl_p->ninl_val[0], 0, 0);
-	}
-	nl_p = PropList_lookup(&S_config_netboot, CFGPROP_AFP_UID_START);
-	if (nl_p && nl_p->ninl_len) {
-	    S_afp_uid_start = strtol(nl_p->ninl_val[0], 0, 0);
-	}
-	nl_p = PropList_lookup(&S_config_netboot, CFGPROP_AGE_TIME_SECONDS);
-	if (nl_p && nl_p->ninl_len) {
-	    S_age_time_seconds = strtoul(nl_p->ninl_val[0], 0, 0);
-	}
-	nl_p = PropList_lookup(&S_config_netboot, CFGPROP_MACHINE_NAME_FORMAT);
-	if (nl_p && nl_p->ninl_len && S_host_format_valid(nl_p->ninl_val[0])) {
-	    S_machine_name_format = nl_p->ninl_val[0];
+    if (plist != NULL) {
+	set_number_from_plist(plist, CFSTR(CFGPROP_SHADOW_SIZE_MEG),
+			      CFGPROP_SHADOW_SIZE_MEG, 
+			      &G_shadow_size_meg);
+	set_number_from_plist(plist, CFSTR(CFGPROP_AFP_USERS_MAX),
+			      CFGPROP_AFP_USERS_MAX, 
+			      &S_afp_users_max);
+	set_number_from_plist(plist, CFSTR(CFGPROP_AFP_UID_START),
+			      CFGPROP_AFP_UID_START, 
+			      &S_afp_uid_start);
+	set_number_from_plist(plist, CFSTR(CFGPROP_AGE_TIME_SECONDS),
+			      CFGPROP_AGE_TIME_SECONDS, 
+			      &S_age_time_seconds);
+	prop = CFDictionaryGetValue(plist, CFSTR(CFGPROP_MACHINE_NAME_FORMAT));
+	if (isA_CFString(prop) != NULL) {
+	    char	host_format[256];
+
+	    if (CFStringGetCString(prop, host_format, sizeof(host_format),
+				   kCFStringEncodingUTF8)
+		&& S_host_format_valid(host_format)) {
+		S_machine_name_format = strdup(host_format);
+	    }
+	    else {
+		my_log(LOG_INFO, "Invalid '%s' property",
+		       CFGPROP_MACHINE_NAME_FORMAT);
+	    }
 	}
     }
     my_log(LOG_INFO, 
@@ -343,10 +375,9 @@ S_read_config()
     return;
 }
 
-static boolean_t
+static void
 S_set_sharepoint_permissions(NBSPListRef list, uid_t user, gid_t group)
 {
-    boolean_t		ret = TRUE;
     int 		i;
 	
     for (i = 0; i < NBSPList_count(list); i++) {
@@ -357,23 +388,21 @@ S_set_sharepoint_permissions(NBSPListRef list, uid_t user, gid_t group)
 	 * Verify permissions/ownership
 	 */
 	if (set_privs(entry->path, &sb, user, group, SHARED_DIR_PERMS, 
-		      FALSE) == FALSE) {
+		      FALSE) == FALSE
+	    && entry->is_readonly == FALSE) {
 	    my_log(LOG_INFO, "bsdpd: setting permissions on '%s' failed: %m", 
 		   entry->path);
-	    ret = FALSE;
 	}
     }
-
-    return (ret);
+    return;
 }
 
-static boolean_t
+static void
 S_set_bootfile_permissions(NBImageEntryRef entry, const char * dir,
 			   uid_t user, gid_t group)
 {
     int 	i;
     char	path[PATH_MAX];
-    boolean_t	ret = TRUE;
     struct stat	sb;
 
     /* set permissions on bootfile */
@@ -387,20 +416,18 @@ S_set_bootfile_permissions(NBImageEntryRef entry, const char * dir,
 	    snprintf(path, sizeof(path), "%s/%s/%s", dir, arch, 
 		     entry->bootfile);
 	}
-	if (set_privs(path, &sb, user, group, SHARED_FILE_PERMS, FALSE)
-	    == FALSE) {
+	if (set_privs(path, &sb, user, group, SHARED_FILE_PERMS, FALSE) == FALSE
+	    && entry->sharepoint->is_readonly == FALSE) {
 	    my_log(LOG_INFO, "bsdpd: setting permissions on '%s' failed: %m", 
 		   path);
-	    ret = FALSE;
 	}
     }
-    return (ret);
+    return;
 }
 
-static boolean_t
+static void
 S_set_image_permissions(NBImageListRef list, uid_t user, gid_t group)
 {
-    boolean_t		ret = TRUE;
     int 		i;
     char		dir[PATH_MAX];
     char		file[PATH_MAX];
@@ -410,37 +437,36 @@ S_set_image_permissions(NBImageListRef list, uid_t user, gid_t group)
 	struct stat	sb;
 
 	/* set permissions on .nbi directory */
-	snprintf(dir, sizeof(dir), "%s/%s", entry->sharepoint.path,
+	snprintf(dir, sizeof(dir), "%s/%s", entry->sharepoint->path,
 		 entry->dir_name);
-	if (set_privs(dir, &sb, user, group, SHARED_DIR_PERMS, FALSE)
-	    == FALSE) {
+	if (set_privs(dir, &sb, user, group, SHARED_DIR_PERMS, FALSE) == FALSE
+	    && entry->sharepoint->is_readonly == FALSE) {
 	    my_log(LOG_INFO, "bsdpd: setting permissions on '%s' failed: %m", 
 		   dir);
-	    ret = FALSE;
 	}
-	ret = S_set_bootfile_permissions(entry, dir, user, group);
+	S_set_bootfile_permissions(entry, dir, user, group);
 	switch (entry->type) {
 	case kNBImageTypeClassic:
 	    /* set permissions on shared image */
 	    snprintf(file, sizeof(file), "%s/%s", dir, 
 		     entry->type_info.classic.shared);
 	    if (set_privs(file, &sb, user, group, SHARED_FILE_PERMS, FALSE)
-		== FALSE) {
+		== FALSE
+		&& entry->sharepoint->is_readonly == FALSE) {
 		my_log(LOG_INFO, 
 		       "bsdpd: setting permissions on '%s' failed: %m", 
 		       file);
-		ret = FALSE;
 	    }
 	    /* set permissions on private image */
 	    if (entry->type_info.classic.private != NULL) {
 		snprintf(file, sizeof(file), "%s/%s", dir, 
 			 entry->type_info.classic.private);
 		if (set_privs(file, &sb, user, group, SHARED_FILE_PERMS, FALSE)
-		    == FALSE) {
+		    == FALSE
+		    && entry->sharepoint->is_readonly == FALSE) {
 		    my_log(LOG_INFO, 
 			   "bsdpd: setting permissions on '%s' failed: %m", 
 			   file);
-		    ret = FALSE;
 		}
 	    }
 	    break;
@@ -451,11 +477,11 @@ S_set_image_permissions(NBImageListRef list, uid_t user, gid_t group)
 		snprintf(file, sizeof(file), "%s/%s", dir, 
 			 entry->type_info.http.root_path);
 		if (set_privs(file, &sb, user, group, SHARED_FILE_PERMS, FALSE)
-		    == FALSE) {
+		    == FALSE
+		    && entry->sharepoint->is_readonly == FALSE) {
 		    my_log(LOG_INFO, 
 			   "bsdpd: setting permissions on '%s' failed: %m", 
 			   file);
-		    ret = FALSE;
 		}
 	    }
 	    break;
@@ -466,11 +492,11 @@ S_set_image_permissions(NBImageListRef list, uid_t user, gid_t group)
 		snprintf(file, sizeof(file), "%s/%s", dir, 
 			 entry->type_info.nfs.root_path);
 		if (set_privs(file, &sb, user, group, SHARED_FILE_PERMS, FALSE)
-		    == FALSE) {
+		    == FALSE
+		    && entry->sharepoint->is_readonly == FALSE) {
 		    my_log(LOG_INFO, 
 			   "bsdpd: setting permissions on '%s' failed: %m", 
 			   file);
-		    ret = FALSE;
 		}
 	    }
 	    break;
@@ -478,12 +504,12 @@ S_set_image_permissions(NBImageListRef list, uid_t user, gid_t group)
 	    break;
 	}
     }
-
-    return (ret);
+    return;
 }
 
 static boolean_t
 S_insert_image_list(const char * arch, const char * sysid, 
+		    const struct ether_addr * ether,
 		    const u_int16_t * attr_filter_list,
 		    int n_attr_filter_list, dhcpoa_t * options, 
 		    dhcpoa_t * bsdp_options)
@@ -514,7 +540,7 @@ S_insert_image_list(const char * arch, const char * sysid,
 	 * don't supply the image.
 	 */
 	image_entry = NBImageList_element(G_image_list, i);
-	if (!NBImageEntry_supported_sysid(image_entry, arch, sysid)
+	if (!NBImageEntry_supported_sysid(image_entry, arch, sysid, ether)
 	    || !NBImageEntry_attributes_match(image_entry, attr_filter_list,
 					      n_attr_filter_list)) {
 	    continue;
@@ -594,25 +620,14 @@ S_insert_image_list(const char * arch, const char * sysid,
 }
 
 boolean_t
-bsdp_init()
+bsdp_init(CFDictionaryRef plist)
 {
     static boolean_t 	first = TRUE;
-    NBImageListRef	new_image_list;
-    NBSPListRef 	new_sharepoints;
-    BSDPClients_t 	new_clients;
-    AFPUsers_t		new_users;
 
     G_disk_space_warned = FALSE;
     if (first == TRUE) {
 	struct group *	group_ent_p;
 	struct timeval 	tv;
-
-	if (ni_local == NULL) {
-	    my_log(LOG_INFO,
-		   "bsdpd: local netinfo domain not yet open");
-	    goto failed;
-	}
-	PropList_init(&S_config_netboot, "/config/NetBootServer");
 
 	/* get the netboot group id, or create the group if necessary */
 	group_ent_p = getgrnam(NETBOOT_GROUP);
@@ -637,71 +652,68 @@ bsdp_init()
 	srandom(tv.tv_usec);
 	first = FALSE;
     }
-    S_read_config();
+    if (plist != NULL) {
+	plist = CFDictionaryGetValue(plist, BOOTPD_PLIST_NETBOOT);
+    }
+    S_read_config(plist);
+
+    /* free the old information */
+    NBSPList_free(&S_sharepoints);
+    NBSPList_free(&G_client_sharepoints);
+    NBImageList_free(&G_image_list);
+    BSDPClients_free(&S_clients);
+    AFPUserList_free(&S_afp_users);
 
     /* get the list of image sharepoints */
-    new_sharepoints = NBSPList_init(NETBOOT_SHAREPOINT_LINK);
-    if (new_sharepoints == NULL) {
+    S_sharepoints = NBSPList_init(NETBOOT_SHAREPOINT_LINK,
+				  NBSP_READONLY_OK);
+    if (S_sharepoints == NULL) {
 	my_log(LOG_INFO, "bsdpd: no sharepoints defined");
 	goto failed;
     }
-    NBSPList_free(&S_sharepoints);
-    S_sharepoints = new_sharepoints;
-    if (S_set_sharepoint_permissions(S_sharepoints, ROOT_UID, 
-				     G_admin_gid) == FALSE) {
-	goto failed;
-    }
+    S_set_sharepoint_permissions(S_sharepoints, ROOT_UID, 
+				 G_admin_gid);
     if (debug) {
 	printf("NetBoot image sharepoints\n");
 	NBSPList_print(S_sharepoints);
     }
 
     /* get the list of client sharepoints */
-    new_sharepoints = NBSPList_init(NETBOOT_CLIENTS_SHAREPOINT_LINK);
-    if (new_sharepoints == NULL) {
+    G_client_sharepoints = NBSPList_init(NETBOOT_CLIENTS_SHAREPOINT_LINK,
+					 NBSP_NO_READONLY);
+    if (G_client_sharepoints == NULL) {
 	my_log(LOG_INFO, "bsdpd: no client sharepoints defined");
-	goto failed;
     }
-    NBSPList_free(&G_client_sharepoints);
-    G_client_sharepoints = new_sharepoints;
-    if (S_set_sharepoint_permissions(G_client_sharepoints, ROOT_UID, 
-				     G_admin_gid) == FALSE) {
-	goto failed;
-    }
-    if (debug) {
-	printf("NetBoot client sharepoints\n");
-	NBSPList_print(G_client_sharepoints);
+    else {
+	S_set_sharepoint_permissions(G_client_sharepoints, ROOT_UID,
+				     G_admin_gid);
+	if (debug) {
+	    printf("NetBoot client sharepoints\n");
+	    NBSPList_print(G_client_sharepoints);
+	}
     }
 
     /* get the list of netboot images */
-    new_image_list = NBImageList_init(S_sharepoints);
-    if (new_image_list == NULL) {
+    G_image_list = NBImageList_init(S_sharepoints,
+				    G_client_sharepoints != NULL);
+    if (G_image_list == NULL) {
 	my_log(LOG_INFO, "bsdpd: no NetBoot images found");
 	goto failed;
     }
-    NBImageList_free(&G_image_list);
-    G_image_list = new_image_list;
     if (debug) {
 	NBImageList_print(G_image_list);
     }
-    if (S_set_image_permissions(G_image_list, ROOT_UID, G_admin_gid)
-	== FALSE) {
-	goto failed;
-    }
-    if (BSDPClients_init(&new_clients) == FALSE) {
+    S_set_image_permissions(G_image_list, ROOT_UID, G_admin_gid);
+    if (BSDPClients_init(&S_clients) == FALSE) {
 	my_log(LOG_INFO, "bsdpd: BSDPClients_init failed");
 	goto failed;
     }
-    BSDPClients_free(&S_clients);
-    S_clients = new_clients;
-    if (AFPUsers_init(&new_users, ni_local) == FALSE) {
-	my_log(LOG_INFO, "bsdpd: AFPUsers_init failed");
+    if (AFPUserList_init(&S_afp_users) == FALSE) {
+	my_log(LOG_INFO, "bsdpd: AFPUserList_init failed");
 	goto failed;
     }
-    AFPUsers_create(&new_users, S_netboot_gid, 
-		    S_afp_uid_start, S_afp_users_max);
-    AFPUsers_free(&S_afp_users);
-    S_afp_users = new_users;
+    AFPUserList_create(&S_afp_users, S_netboot_gid, 
+		       S_afp_uid_start, S_afp_users_max);
     S_next_host_number = S_host_number_max() + 1;
     return (TRUE);
 
@@ -709,17 +721,15 @@ bsdp_init()
     return (FALSE);
 }
 
-static PLCacheEntry_t *
-S_reclaim_afp_user(struct timeval * time_in_p, char * * afp_user_p,
-		   boolean_t * modified)
+static AFPUserRef
+S_reclaim_afp_user(struct timeval * time_in_p, boolean_t * modified)
 {
-    PLCacheEntry_t *	reclaimed_entry = NULL;
+    AFPUserRef		reclaimed_entry = NULL;
     PLCacheEntry_t *	scan;
-
-    *afp_user_p = NULL;
 
     for (scan = S_clients.list.tail; scan; scan = scan->prev) {
 	char *			afp_user;
+	CFStringRef		afp_user_cf;
 	char *			bound;
 	int			host_number = 0;
 	char *			last_boot;
@@ -749,8 +759,10 @@ S_reclaim_afp_user(struct timeval * time_in_p, char * * afp_user_p,
 	    }
 	}
 	/* lookup the entry we're going to steal first */
-	reclaimed_entry = PLCache_lookup_prop(&S_afp_users.list, 
-					      NIPROP_NAME, afp_user, TRUE);
+	afp_user_cf = CFStringCreateWithCString(NULL, afp_user,
+						kCFStringEncodingASCII);
+	reclaimed_entry = AFPUserList_lookup(&S_afp_users, afp_user_cf);
+	CFRelease(afp_user_cf);
 	if (reclaimed_entry == NULL) {
 	    /* netboot user has been removed, stale entry */
 	    ni_delete_prop(&scan->pl, NIPROP_NETBOOT_BOUND, modified);
@@ -767,38 +779,44 @@ S_reclaim_afp_user(struct timeval * time_in_p, char * * afp_user_p,
 	    my_log(LOG_DEBUG, "NetBoot: reclaimed login %s from %s",
 		   afp_user, name);
 	}
-	/* mark the client has no longer bound */
+	/* mark the client as no longer bound */
 	ni_delete_prop(&scan->pl, NIPROP_NETBOOT_AFP_USER, modified);
 	ni_delete_prop(&scan->pl, NIPROP_NETBOOT_BOUND, modified);
-	*afp_user_p = ni_valforprop(&reclaimed_entry->pl, NIPROP_NAME);
 	break;
     }
     return (reclaimed_entry);
 }
 
-static PLCacheEntry_t *
-S_next_afp_user(char * * afp_user)
+static AFPUserRef
+S_next_afp_user()
 {
-    PLCacheEntry_t * scan;
+    int		i;
+    int		n;
 
-    for (scan = S_afp_users.list.head; scan; scan = scan->next) {
-	int		name_index;
-	ni_namelist *	nl_p;
+    n = CFArrayGetCount(S_afp_users.list);
+    for (i = 0; i < n; i++) {
+	char		*afp_user;
+	char		afp_user_buf[256];
+	AFPUserRef	user;
 
-	name_index = ni_proplist_match(scan->pl, NIPROP_NAME, NULL);
-	if (name_index == NI_INDEX_NULL)
-	    continue;
-	nl_p = &scan->pl.nipl_val[name_index].nip_val;
-	if (nl_p->ninl_len == 0)
-	    continue;
-
+	user = (AFPUserRef)CFArrayGetValueAtIndex(S_afp_users.list, i);
+	afp_user = AFPUser_get_user(user, afp_user_buf, sizeof(afp_user_buf));
 	if (PLCache_lookup_prop(&S_clients.list, NIPROP_NETBOOT_AFP_USER,
-				nl_p->ninl_val[0], FALSE) == NULL) {
-	    *afp_user = nl_p->ninl_val[0];
-	    return (scan);
+				afp_user, FALSE) == NULL) {
+	    return (user);
 	}
     }
+
     return (NULL);
+}
+
+static __inline__ struct in_addr
+image_server_ip(NBImageEntryRef image_entry, struct in_addr server_ip)
+{
+    if (image_entry->load_balance_ip.s_addr != 0) {
+	server_ip = image_entry->load_balance_ip;
+    }
+    return (server_ip);
 }
 
 static boolean_t
@@ -818,8 +836,8 @@ X_netboot(NBImageEntryRef image_entry, struct in_addr server_ip,
 	}
 	else {
 	    snprintf(tmp, sizeof(tmp), "nfs:%s:%s:%s/%s",
-		     inet_ntoa(server_ip),
-		     image_entry->sharepoint.path, image_entry->dir_name,
+		     inet_ntoa(image_server_ip(image_entry, server_ip)),
+		     image_entry->sharepoint->path, image_entry->dir_name,
 		     image_entry->type_info.nfs.root_path);
 	    root_path = tmp;
 	}
@@ -831,8 +849,8 @@ X_netboot(NBImageEntryRef image_entry, struct in_addr server_ip,
 	}
 	else {
 	    snprintf(tmp, sizeof(tmp), "http://%s/NetBoot/%s/%s/%s",
-		     inet_ntoa(server_ip), 
-		     image_entry->sharepoint.name,
+		     inet_ntoa(image_server_ip(image_entry, server_ip)),
+		     image_entry->sharepoint->name,
 		     image_entry->dir_name,
 		     image_entry->type_info.http.root_path);
 	    root_path = tmp;
@@ -897,17 +915,17 @@ S_add_bootfile(NBImageEntryRef entry, const char * arch, const char * hostname,
     if (strcmp(arch, ARCH_PPC) == 0 && entry->ppc_bootfile_no_subdir) {
 	snprintf(tftp_path, sizeof(tftp_path),
 		 NETBOOT_TFTP_DIRECTORY "/%s/%s/%s", 
-		 entry->sharepoint.name, 
+		 entry->sharepoint->name, 
 		 entry->dir_name, entry->bootfile);
     }
     else {
 	snprintf(tftp_path, sizeof(tftp_path),
 		 NETBOOT_TFTP_DIRECTORY "/%s/%s/%s/%s", 
-		 entry->sharepoint.name, 
+		 entry->sharepoint->name, 
 		 entry->dir_name, arch, entry->bootfile);
     }
-    if (bootp_add_bootfile(NULL, hostname, tftp_path,
-			   pkt_bootfile, pkt_bootfile_size) == FALSE) {
+    if (bootp_add_bootfile(NULL, hostname, tftp_path, pkt_bootfile,
+			   pkt_bootfile_size) == FALSE) {
 	my_log(LOG_INFO, "NetBoot: bootp_add_bootfile %s failed",
 	       tftp_path);
 	return (FALSE);
@@ -924,15 +942,15 @@ S_client_update(struct in_addr * client_ip_p, const char * arch,
 		struct timeval * time_in_p)
 {
     char *		afp_user = NULL;
+    char		afp_user_buf[256];
     char *		hostname;
     int			host_number;
     bsdp_image_id_t    	image_id;
     boolean_t		modified = FALSE;
     char 		passwd[AFP_PASSWORD_LEN + 1];
-    unsigned long	password = 0;
     boolean_t		ret = TRUE;
     uid_t		uid = 0;
-    PLCacheEntry_t *	user_entry = NULL;
+    AFPUserRef		user_entry = NULL;
     char *		val = NULL;
 
     image_id = image_entry->image_id;
@@ -947,17 +965,20 @@ S_client_update(struct in_addr * client_ip_p, const char * arch,
     if (image_entry->diskless || image_entry->type == kNBImageTypeClassic) {
 	afp_user = ni_valforprop(&entry->pl, NIPROP_NETBOOT_AFP_USER);
 	if (afp_user != NULL) {
-	    user_entry = PLCache_lookup_prop(&S_afp_users.list,
-					     NIPROP_NAME, afp_user, TRUE);
+	    CFStringRef	name;
+
+	    name = CFStringCreateWithCString(NULL, afp_user,
+					     kCFStringEncodingASCII);
+	    user_entry = AFPUserList_lookup(&S_afp_users, name);
+	    CFRelease(name);
 	    if (user_entry == NULL) {
 		ni_delete_prop(&entry->pl, NIPROP_NETBOOT_AFP_USER, &modified);
 	    }
 	}
 	if (user_entry == NULL) {
-	    user_entry = S_next_afp_user(&afp_user);
+	    user_entry = S_next_afp_user();
 	    if (user_entry == NULL) {
-		user_entry = S_reclaim_afp_user(time_in_p, &afp_user, 
-						&modified);
+		user_entry = S_reclaim_afp_user(time_in_p, &modified);
 	    }
 	    if (user_entry == NULL) {
 		my_log(LOG_INFO, 
@@ -965,15 +986,16 @@ S_client_update(struct in_addr * client_ip_p, const char * arch,
 		       S_afp_users_max, hostname);
 		return (FALSE);
 	    }
-	    ni_set_prop(&entry->pl, NIPROP_NETBOOT_AFP_USER, afp_user, 
+	    afp_user = AFPUser_get_user(user_entry, afp_user_buf,
+					sizeof(afp_user_buf));
+	    ni_set_prop(&entry->pl, NIPROP_NETBOOT_AFP_USER, afp_user,
 			&modified);
 	}
-	password = random();
-	uid = strtoul(ni_valforprop(&user_entry->pl, NIPROP_UID), NULL, 0);
-	
-	sprintf(passwd, "%08lx", password);
-	if (AFPUsers_set_password(&S_afp_users, user_entry, passwd)
-	    == FALSE) {
+
+	uid = AFPUser_get_uid(user_entry);
+
+	if (AFPUser_set_random_password(user_entry,
+					passwd, sizeof(passwd)) == FALSE) {
 	    my_log(LOG_INFO, "NetBoot: failed to set password for %s",
 		   hostname);
 	    return (FALSE);
@@ -1001,12 +1023,13 @@ S_client_update(struct in_addr * client_ip_p, const char * arch,
     case kNBImageTypeBootFileOnly:
 	break;
     default:
-	my_log(LOG_INFO, "NetBoot: invalid type %d\n", image_entry->type);
+	my_log(LOG_INFO, "NetBoot: invalid type %d", image_entry->type);
 	return (FALSE);
 	break;
     }
     if (S_add_bootfile(image_entry, arch, hostname, 
-		       reply->dp_file, sizeof(reply->dp_file)) == FALSE) {
+		       (char *)reply->dp_file, sizeof(reply->dp_file))
+	== FALSE) {
 	return (FALSE);
     }
     {
@@ -1041,14 +1064,13 @@ S_client_create(struct in_addr client_ip,
 		dhcpoa_t * bsdp_options, struct timeval * time_in_p)
 {
     char *		afp_user = NULL;
-    ni_id		child = {0, 0};
+    char		afp_user_buf[256];
     char		hostname[256];
     bsdp_image_id_t 	image_id; 
     int			host_number;
     char 		passwd[AFP_PASSWORD_LEN + 1];
-    unsigned long	password;
     ni_proplist		pl;
-    PLCacheEntry_t *	user_entry;
+    AFPUserRef		user_entry;
     uid_t		uid = 0;
 
     image_id = image_entry->image_id;
@@ -1072,21 +1094,23 @@ S_client_create(struct in_addr client_ip,
     }
     ni_proplist_addprop(&pl, NIPROP_IPADDR, inet_ntoa(client_ip));
     if (image_entry->diskless || image_entry->type == kNBImageTypeClassic) {
-	user_entry = S_next_afp_user(&afp_user);
+	user_entry = S_next_afp_user();
 	if (user_entry == NULL) {
-	    user_entry = S_reclaim_afp_user(time_in_p, &afp_user, NULL);
+	    user_entry = S_reclaim_afp_user(time_in_p, NULL);
 	    if (user_entry == NULL) {
 		my_log(LOG_INFO, "NetBoot: AFP login capacity of %d reached",
 		       S_afp_users_max);
 		goto failed;
 	    }
 	}
-	password = random();
-	uid = strtoul(ni_valforprop(&user_entry->pl, NIPROP_UID), NULL, 0);
+
+	uid = AFPUser_get_uid(user_entry);
+	afp_user = AFPUser_get_user(user_entry, afp_user_buf,
+				    sizeof(afp_user_buf));
 	ni_proplist_addprop(&pl, NIPROP_NETBOOT_AFP_USER, afp_user);
-	sprintf(passwd, "%08lx", password);
-	if (AFPUsers_set_password(&S_afp_users, user_entry, passwd)
-	    == FALSE) {
+
+	if (AFPUser_set_random_password(user_entry,
+					passwd, sizeof(passwd)) == FALSE) {
 	    my_log(LOG_INFO, "NetBoot: failed to set password for %s",
 		   hostname);
 	    goto failed;
@@ -1112,18 +1136,19 @@ S_client_create(struct in_addr client_ip,
     case kNBImageTypeBootFileOnly:
 	break;
     default:
-	my_log(LOG_INFO, "NetBoot: invalid type %d\n", image_entry->type);
+	my_log(LOG_INFO, "NetBoot: invalid type %d", image_entry->type);
 	goto failed;
 	break;
     }
     if (S_add_bootfile(image_entry, arch, hostname, 
-		       reply->dp_file, sizeof(reply->dp_file)) == FALSE) {
+		       (char *)reply->dp_file, sizeof(reply->dp_file))
+	== FALSE) {
 	goto failed;
     }
 
     ni_set_prop(&pl, NIPROP_NETBOOT_BOUND, "true", NULL);
 
-    PLCache_add(&S_clients.list, PLCacheEntry_create(child, pl));
+    PLCache_add(&S_clients.list, PLCacheEntry_create(pl));
     if (PLCache_write(&S_clients.list, BSDP_CLIENTS_FILE) == FALSE) {
 	my_log(LOG_INFO, 
 	       "NetBoot: failed to save file " BSDP_CLIENTS_FILE ", %m");
@@ -1229,9 +1254,9 @@ make_bsdp_failed_reply(struct dhcp * reply, int pkt_size,
 
 
 static boolean_t
-S_prop_u_int32(ni_proplist * pl_p, u_char * prop, u_int32_t * retval)
+S_prop_u_int32(ni_proplist * pl_p, const char * prop, u_int32_t * retval)
 {
-    ni_name str = ni_valforprop(pl_p, prop);
+    ni_name str = ni_valforprop(pl_p, (char *)prop);
 
     if (str == NULL)
 	return (FALSE);
@@ -1347,12 +1372,12 @@ void
 bsdp_dhcp_request(request_t * request, dhcp_msgtype_t dhcpmsg)
 {
     PLCacheEntry_t *	entry;
-    u_char *		idstr;
+    char *		idstr;
     boolean_t		modified = FALSE;
     int		 	optlen;
     struct in_addr * 	req_ip;
     struct dhcp *	rq = request->pkt;
-    u_char		scratch_idstr[3 * sizeof(rq->dp_chaddr)];
+    char		scratch_idstr[3 * sizeof(rq->dp_chaddr)];
 
     if (dhcpmsg != dhcp_msgtype_request_e
 	|| rq->dp_htype != ARPHRD_ETHER 
@@ -1404,7 +1429,7 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
     char		bsdp_buf[DHCP_OPTION_SIZE_MAX];
     dhcpoa_t		bsdp_options;
     PLCacheEntry_t *	entry;
-    u_char *		idstr = NULL;
+    char *		idstr = NULL;
     const u_int16_t *	filter_attrs = NULL;
     int			max_packet;
     dhcpoa_t		options;
@@ -1413,7 +1438,7 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
     struct dhcp *	reply = NULL;
     struct dhcp *	rq = request->pkt;
     u_int16_t		scratch_attrs[N_SCRATCH_ATTRS];
-    u_char		scratch_idstr[3 * sizeof(rq->dp_chaddr)];
+    char		scratch_idstr[3 * sizeof(rq->dp_chaddr)];
     char		txbuf[2048];
 
     if (rq->dp_htype != ARPHRD_ETHER || rq->dp_hlen != ETHER_ADDR_LEN) {
@@ -1494,7 +1519,9 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
 	   */
 	  image_entry = NBImageList_elementWithID(G_image_list, image_id);
 	  if (image_entry == NULL
-	      || !NBImageEntry_supported_sysid(image_entry, arch, sysid)
+	      || !NBImageEntry_supported_sysid(image_entry, arch, sysid,
+					       (const struct ether_addr *)
+					       rq->dp_chaddr)
 	      || !NBImageEntry_attributes_match(image_entry, filter_attrs,
 						n_filter_attrs)) {
 	      goto no_reply;
@@ -1552,8 +1579,13 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
 	  { /* send a reply */
 	      int 		size;
 	      
-	      reply->dp_siaddr = if_inet_addr(request->if_p);
-	      strcpy(reply->dp_sname, server_name);
+	      if (image_entry->load_balance_ip.s_addr != 0) {
+		  reply->dp_siaddr = image_entry->load_balance_ip;
+	      }
+	      else {
+		  reply->dp_siaddr = if_inet_addr(request->if_p);
+		  strcpy((char *)reply->dp_sname, server_name);
+	      }
 
 	      size = sizeof(struct dhcp) + sizeof(rfc_magic) +
 		  dhcpoa_used(&options);
@@ -1627,6 +1659,8 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
 		default_image = NBImageList_default(G_image_list,
 						    arch,
 						    filter_sysid,
+						    (const struct ether_addr *)
+						    rq->dp_chaddr,
 						    filter_attrs,
 						    n_filter_attrs);
 		if (default_image == NULL) {
@@ -1694,7 +1728,9 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
 			     = NBImageList_elementWithID(G_image_list, 
 							 image_id)) == NULL)
 			|| !NBImageEntry_supported_sysid(image_entry, arch,
-							 filter_sysid)
+							 filter_sysid,
+							 (const struct ether_addr *)
+							 rq->dp_chaddr)
 			|| !NBImageEntry_attributes_match(image_entry, 
 							  filter_attrs,
 							  n_filter_attrs)) {
@@ -1728,6 +1764,8 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
 		}
 		else {
 		    if (!S_insert_image_list(arch, filter_sysid, 
+					     (const struct ether_addr *)
+					     rq->dp_chaddr,
 					     filter_attrs, n_filter_attrs,
 					     &options, &bsdp_options)) {
 			goto no_reply;
@@ -1777,7 +1815,9 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
 							    image_id);
 		    if (image_entry == NULL
 			|| !NBImageEntry_supported_sysid(image_entry, arch,
-							 filter_sysid)) {
+							 filter_sysid,
+							 (const struct ether_addr *)
+							 rq->dp_chaddr)) {
 			/* stale image ID */
 			goto send_failed;
 		    }
@@ -1786,6 +1826,8 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
 		    image_entry = NBImageList_default(G_image_list, 
 						      arch,
 						      filter_sysid,
+						      (const struct ether_addr *)
+						      rq->dp_chaddr,
 						      NULL, 0);
 		    if (image_entry == NULL) {
 			/* no longer a default image */
@@ -1857,6 +1899,13 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
 			   idstr, dhcpoa_err(&options));
 		    goto no_reply;
 		}
+		if (image_entry->load_balance_ip.s_addr != 0) {
+		    reply->dp_siaddr = image_entry->load_balance_ip;
+		}
+		else {
+		    reply->dp_siaddr = if_inet_addr(request->if_p);
+		    strcpy((char *)reply->dp_sname, server_name);
+		}
 		break;
 	    }
 	    default: {
@@ -1886,9 +1935,6 @@ bsdp_request(request_t * request, dhcp_msgtype_t dhcpmsg,
       send_reply:
 	  { /* send a reply */
 	      int size;
-	      
-	      reply->dp_siaddr = if_inet_addr(request->if_p);
-	      strcpy(reply->dp_sname, server_name);
 
 	      size = sizeof(struct dhcp) + sizeof(rfc_magic) +
 		  dhcpoa_used(&options);
@@ -1964,13 +2010,14 @@ old_netboot_request(request_t * request)
     dhcpoa_t		bsdp_options;
     PLCacheEntry_t *	bsdp_entry = NULL;
     NBImageEntryRef	default_image = NULL;
+    NBImageEntryRef	image_entry;
     struct in_addr	iaddr = {0};
-    u_char *		idstr = NULL;
+    char *		idstr = NULL;
     dhcpoa_t		options;
     struct dhcp *	rq = request->pkt;
     struct dhcp *	reply = NULL;
-    u_char		scratch_idstr[32];
-    id			subnet = nil;
+    char		scratch_idstr[32];
+    SubnetRef		subnet;
     char		txbuf[DHCP_PACKET_MIN];
     u_int32_t		version = MACNC_SERVER_VERSION;
 
@@ -1981,6 +2028,7 @@ old_netboot_request(request_t * request)
     default_image = NBImageList_default(G_image_list, 
 					ARCH_PPC,
 					OLD_NETBOOT_SYSID,
+					(const struct ether_addr *)rq->dp_chaddr,
 					NULL, 0);
     if (default_image == NULL) {
 	/* no NetBoot 1.0 images */
@@ -2015,18 +2063,15 @@ old_netboot_request(request_t * request)
 	goto no_reply;
 
     reply->dp_yiaddr = iaddr;
-    reply->dp_siaddr = if_inet_addr(request->if_p);
-    strcpy(reply->dp_sname, server_name);
 
     /* add the client-specified parameters */
-    (void)add_subnet_options(NULL, NULL, iaddr, 
+    (void)add_subnet_options(NULL, iaddr, 
 			     request->if_p, &options, NULL, 0);
 
     /* ready the vendor-specific option area to hold bsdp options */
     dhcpoa_init_no_end(&bsdp_options, bsdp_buf, sizeof(bsdp_buf));
     
     if (bsdp_entry) {
-	NBImageEntryRef	image_entry;
 	bsdp_image_id_t	image_id;
 
 	if ((S_prop_u_int32(&bsdp_entry->pl, NIPROP_NETBOOT_IMAGE_ID, 
@@ -2034,7 +2079,9 @@ old_netboot_request(request_t * request)
 	    || ((image_entry 
 		 = NBImageList_elementWithID(G_image_list, image_id)) == NULL)
 	    || (NBImageEntry_supported_sysid(image_entry, ARCH_PPC,
-					     OLD_NETBOOT_SYSID)
+					     OLD_NETBOOT_SYSID, 
+					     (const struct ether_addr *)
+					     rq->dp_chaddr)
 		== FALSE)) {
 	    /* stale image id, use default */
 	    image_entry = default_image;
@@ -2047,9 +2094,10 @@ old_netboot_request(request_t * request)
 	}
     }
     else {
+	image_entry = default_image;
 	if (S_client_create(iaddr, reply, idstr, ARCH_PPC, "unknown", 
 			    if_inet_addr(request->if_p), 
-			    default_image,
+			    image_entry,
 			    &options, &bsdp_options, request->time_in_p) 
 	    == FALSE) {
 	    goto no_reply;
@@ -2081,9 +2129,13 @@ old_netboot_request(request_t * request)
     { /* send a reply */
 	int size;
 	
-	reply->dp_siaddr = if_inet_addr(request->if_p);
-	strcpy(reply->dp_sname, server_name);
-	
+	if (image_entry->load_balance_ip.s_addr != 0) {
+	    reply->dp_siaddr = image_entry->load_balance_ip;
+	}
+	else {
+	    reply->dp_siaddr = if_inet_addr(request->if_p);
+	    strcpy((char *)reply->dp_sname, server_name);
+	}
 	size = sizeof(struct dhcp) + sizeof(rfc_magic) +
 	    dhcpoa_used(&options);
 	if (size < sizeof(struct bootp)) {
@@ -2109,3 +2161,32 @@ old_netboot_request(request_t * request)
     return (TRUE);
 }
 
+#ifdef TEST_BSDPD
+
+#include "AFPUsers.c"
+#include "bootpdfile.c"
+#define main bootpd_main
+#include "bootpd.c"
+#undef main
+#include "dhcpd.c"
+#include "macNC.c"
+
+int 
+main(int argc, char * argv[])
+{
+    struct group *	group_ent_p;
+
+    group_ent_p = getgrnam(NETBOOT_GROUP);
+    if (group_ent_p == NULL) {
+#define NETBOOT_GID	120
+	if (S_create_netboot_group(NETBOOT_GID, &S_netboot_gid) == FALSE) {
+	    printf("Could not create group '%s'\n", NETBOOT_GROUP);
+	    exit(1);
+	}
+    }
+
+    exit(0);
+    return (0);
+}
+
+#endif TEST_BSDPD

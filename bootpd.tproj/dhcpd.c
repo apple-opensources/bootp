@@ -21,8 +21,8 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 /*
- * dhcpd.m
- * - netinfo-aware DHCP server
+ * dhcpd.c
+ * - DHCP server
  */
 
 /* 
@@ -49,6 +49,7 @@
 #include <arpa/inet.h>
 #include <net/if_arp.h>
 #include <mach/boolean.h>
+#include "util.h"
 #include "netinfo.h"
 #include "dhcp.h"
 #include "rfc_options.h"
@@ -57,21 +58,20 @@
 #include "hostlist.h"
 #include "interfaces.h"
 #include "dhcpd.h"
-#include "NIDomain.h"
 #include "NICache.h"
 #include "NICachePrivate.h"
 #include "dhcplib.h"
 #include "bootpd.h"
+#include "subnets.h"
+#include "bootpdfile.h"
+#include "bootplookup.h"
 
-#import "subnetDescr.h"
 
 #define MAX_RETRY	5
 
 static boolean_t	S_extend_leases = TRUE;
 
 typedef struct {
-    NIDomain_t *	domain;
-    ni_id		dir;
     PLCache_t		list;
 } DHCPLeases_t;
 
@@ -227,7 +227,7 @@ S_commit_mods()
     return (PLCache_write(&S_leases.list, DHCP_LEASES_FILE));
 }
 
-static __inline__ u_char *
+static __inline__ char *
 S_lease_propval(ni_proplist * pl_p)
 {
     return (ni_valforprop(pl_p, NIPROP_DHCP_LEASE));
@@ -239,7 +239,7 @@ static void
 S_set_lease(ni_proplist * pl_p, dhcp_time_secs_t lease_time_expiry, 
 	    boolean_t * mod)
 {
-    u_char buf[32];
+    char buf[32];
 
     sprintf(buf, LEASE_FORMAT, lease_time_expiry);
     ni_set_prop(pl_p, NIPROP_DHCP_LEASE, buf, mod);
@@ -261,33 +261,6 @@ S_lease_time_expiry(ni_proplist * pl_p)
     }
     return (expiry);
     
-}
-
-static dhcp_lease_t	max_lease_length = DHCP_MAX_LEASE;
-static dhcp_lease_t	min_lease_length = DHCP_MIN_LEASE;
-
-static void
-lease_from_subnet(id subnet, dhcp_lease_t * min_lease, 
-		  dhcp_lease_t * max_lease)
-{
-    ni_namelist * nl_p;
-
-    *min_lease = min_lease_length;
-    *max_lease = max_lease_length;
-    nl_p = [subnet lookup:SUBNETPROP_LEASE_MIN];
-    if (nl_p != NULL && nl_p->ninl_len) {
-	*min_lease = (dhcp_lease_t) strtol(nl_p->ninl_val[0], NULL, 0);
-	if (debug)
-	    printf("min_lease is %d\n", *min_lease); 
-    }
-
-    nl_p = [subnet lookup:SUBNETPROP_LEASE_MAX];
-    if (nl_p != NULL && nl_p->ninl_len) {
-	*max_lease = (dhcp_lease_t) strtol(nl_p->ninl_val[0], NULL, 0);
-	if (debug)
-	    printf("max_lease is %d\n", *max_lease); 
-    }
-    return;
 }
 
 struct dhcp * 
@@ -325,7 +298,7 @@ make_dhcp_reply(struct dhcp * reply, int pkt_size,
 static struct dhcp * 
 make_dhcp_nak(struct dhcp * reply, int pkt_size, 
 	      struct in_addr server_id, dhcp_msgtype_t * msg_p, 
-	      char * nak_msg, struct dhcp * request, 
+	      const char * nak_msg, struct dhcp * request, 
 	      dhcpoa_t * options)
 {
     struct dhcp * r;
@@ -364,15 +337,18 @@ static struct hosts *		S_pending_hosts = NULL;
 
 #define DEFAULT_PENDING_SECS	60
 
-static boolean_t
+static bool
 S_ipinuse(void * arg, struct in_addr ip)
 {
     struct hosts * 	hp;
     struct timeval * 	time_in_p = (struct timeval *)arg;
 
-    if (NICache_ip_in_use(&cache, ip, NULL)) {
+    if (bootp_getbyip_file(ip, NULL, NULL)
+	|| ((use_open_directory == TRUE)
+	    && bootp_getbyip_ds(ip, NULL, NULL))) {
 	return (TRUE);
     }
+
     if (DHCPLeases_ip_in_use(&S_leases, ip) == TRUE) {
 	return (TRUE);
     }
@@ -418,19 +394,21 @@ S_get_hostname(void * hostname_opt, int hostname_opt_len)
 
 static boolean_t
 S_create_host(char * idstr, char * hwstr,
-	      struct in_addr iaddr, u_char * hostname,
+	      struct in_addr iaddr, void * hostname_opt, int hostname_opt_len,
 	      dhcp_time_secs_t lease_time_expiry)
 {
-    ni_id		child = {0, 0};
-    u_char		lease_str[128];
+    char		lease_str[128];
     ni_proplist 	pl;
 
 
     /* add DHCP-specific properties */
     NI_INIT(&pl);
-    if (hostname) {
-	ni_proplist_addprop(&pl, NIPROP_NAME,
-			    (ni_name)hostname);
+    if (hostname_opt) {
+	char *	h;
+	h = S_get_hostname(hostname_opt, hostname_opt_len);
+	
+	ni_proplist_addprop(&pl, NIPROP_NAME, (ni_name)h);
+	free(h);
     }
     ni_proplist_addprop(&pl, NIPROP_IPADDR,
 			(ni_name) inet_ntoa(iaddr));
@@ -441,26 +419,11 @@ S_create_host(char * idstr, char * hwstr,
     sprintf(lease_str, LEASE_FORMAT, lease_time_expiry);
     ni_proplist_addprop(&pl, NIPROP_DHCP_LEASE, (ni_name)lease_str);
 
-    PLCache_add(&S_leases.list, PLCacheEntry_create(child, pl));
+    PLCache_add(&S_leases.list, PLCacheEntry_create(pl));
     PLCache_write(&S_leases.list, DHCP_LEASES_FILE);
     ni_proplist_free(&pl);
     return (TRUE);
 }
-
-
-#if 0
-static boolean_t
-S_find_parameter(u_char * params, int nparams, int param)
-{
-    int i;
-
-    for (i = 0; params && i < nparams; i++) {
-	if (params[i] == param)
-	    return (TRUE);
-    }
-    return (FALSE);
-}
-#endif 0
 
 typedef enum {
     dhcp_binding_none_e = 0,
@@ -468,17 +431,19 @@ typedef enum {
     dhcp_binding_temporary_e,
 } dhcp_binding_t;
 
-static id
+static SubnetRef
 acquire_ip(struct in_addr giaddr, interface_t * if_p,
 	   struct timeval * time_in_p, struct in_addr * iaddr_p)
 {
-    id subnet = nil;
+    SubnetRef 	subnet = NULL;
 
+    if (subnets == NULL) {
+	return (NULL);
+    }
     if (giaddr.s_addr) {
 	*iaddr_p = giaddr;
-	subnet = [subnets acquireIpSupernet:iaddr_p
-			  ClientType:DHCP_CLIENT_TYPE Func:S_ipinuse 
-			  Arg:time_in_p];
+	subnet = SubnetListAcquireAddress(subnets, iaddr_p, S_ipinuse,
+					  time_in_p);
     }
     else {
 	int 			i;
@@ -487,10 +452,9 @@ acquire_ip(struct in_addr giaddr, interface_t * if_p,
 	for (i = 0; i < if_inet_count(if_p); i++) {
 	    info = if_inet_addr_at(if_p, i);
 	    *iaddr_p = info->netaddr;
-	    subnet = [subnets acquireIpSupernet:iaddr_p
-			      ClientType:DHCP_CLIENT_TYPE Func:S_ipinuse 
-			      Arg:time_in_p];
-	    if (subnet != nil) {
+	    subnet = SubnetListAcquireAddress(subnets, iaddr_p, S_ipinuse,
+					      time_in_p);
+	    if (subnet != NULL) {
 		break;
 	    }
 	}
@@ -501,31 +465,37 @@ acquire_ip(struct in_addr giaddr, interface_t * if_p,
 boolean_t
 dhcp_bootp_allocate(char * idstr, char * hwstr, struct dhcp * rq,
 		    interface_t * if_p, struct timeval * time_in_p,
-		    struct in_addr * iaddr_p, id * subnet_p)
+		    struct in_addr * iaddr_p, SubnetRef * subnet_p)
 {
     PLCacheEntry_t * 	entry = NULL;
     struct in_addr 	iaddr;
     dhcp_time_secs_t	lease_time_expiry = 0;
     subnet_match_args_t	match;
-    dhcp_lease_t	max_lease = max_lease_length;
-    dhcp_lease_t	min_lease = min_lease_length;
+    dhcp_lease_t	max_lease;
     boolean_t		modified = FALSE;
-    subnetEntry *	subnet = nil;
+    SubnetRef		subnet = NULL;
 
     bzero(&match, sizeof(match));
     match.if_p = if_p;
     match.giaddr = rq->dp_giaddr;
     match.has_binding = FALSE;
 
-    /* check for a permanent binding */
-    entry = NICache_lookup_hw(&cache, time_in_p, 
-			      rq->dp_htype, rq->dp_chaddr, rq->dp_hlen,
-			      subnet_match, &match,
-			      NULL, &iaddr);
-    if (entry) {
+    if (bootp_getbyhw_file(rq->dp_htype, rq->dp_chaddr, rq->dp_hlen,
+			   subnet_match, &match, &iaddr, NULL, NULL)
+	|| ((use_open_directory == TRUE)
+	    && bootp_getbyhw_ds(rq->dp_htype, rq->dp_chaddr, rq->dp_hlen,
+				subnet_match, &match, &iaddr, NULL, NULL))) {
 	/* infinite lease */
 	*iaddr_p = iaddr;
-	*subnet_p = [subnets entry:iaddr];
+	if (subnets != NULL) {
+	    /* try exact */
+	    subnet = SubnetListGetSubnetForAddress(subnets, iaddr, TRUE);
+	    if (subnet == NULL) {
+		/* try any */
+		subnet = SubnetListGetSubnetForAddress(subnets, iaddr, FALSE);
+	    }
+	}
+	*subnet_p = subnet;
 	return (TRUE);
     }
 
@@ -534,9 +504,11 @@ dhcp_bootp_allocate(char * idstr, char * hwstr, struct dhcp * rq,
 				      subnet_match, &match, &iaddr,
 				      NULL);
     if (entry) {
-	subnet = [subnets entry:iaddr];
-	if (subnet != nil) {
-	    lease_from_subnet(subnet, &min_lease, &max_lease);
+	if (subnets != NULL) {
+	    subnet = SubnetListGetSubnetForAddress(subnets, iaddr, TRUE);
+	}
+	if (subnet != NULL) {
+	    max_lease = SubnetGetMaxLease(subnet);
 	    lease_time_expiry = max_lease + time_in_p->tv_sec;
 	    S_set_lease(&entry->pl, lease_time_expiry, &modified);
 
@@ -555,12 +527,12 @@ dhcp_bootp_allocate(char * idstr, char * hwstr, struct dhcp * rq,
     }
 
     subnet = acquire_ip(rq->dp_giaddr, if_p, time_in_p, &iaddr);
-    if (subnet == nil) {
+    if (subnet == NULL) {
 	if (DHCPLeases_reclaim(&S_leases, if_p, rq->dp_giaddr, 
 			       time_in_p, &iaddr)) {
-	    subnet = [subnets entry:iaddr];
+	    subnet = SubnetListGetSubnetForAddress(subnets, iaddr, TRUE);
 	}
-	if (subnet == nil) {
+	if (subnet == NULL) {
 	    if (debug) {
 		printf("no ip addresses\n");
 	    }
@@ -572,10 +544,10 @@ dhcp_bootp_allocate(char * idstr, char * hwstr, struct dhcp * rq,
     }
     *subnet_p = subnet;
     *iaddr_p = iaddr;
-    lease_from_subnet(subnet, &min_lease, &max_lease);
+    max_lease = SubnetGetMaxLease(subnet);
     lease_time_expiry = max_lease + time_in_p->tv_sec;
     if (S_create_host(idstr, hwstr,
-		      iaddr, NULL, lease_time_expiry) == FALSE) {
+		      iaddr, NULL, 0, lease_time_expiry) == FALSE) {
 	return (FALSE);
     }
     return (TRUE);
@@ -586,34 +558,32 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 	     boolean_t dhcp_allocate)
 {
     dhcp_binding_t	binding = dhcp_binding_none_e;
-    u_char *		bootfile = NULL;
     char		cid_type;
     int			cid_len;
     void *		cid;
-    NIDomain_t *	domain = NULL;
     PLCacheEntry_t * 	entry = NULL;
     boolean_t		has_binding = FALSE;
     void *		hostname_opt = NULL;
     int			hostname_opt_len = 0;
     char *		hostname = NULL;
-    u_char *		hwstr = NULL;
-    u_char *		idstr = NULL;
+    char *		hwstr = NULL;
+    char *		idstr = NULL;
     struct in_addr	iaddr;
     dhcp_lease_t	lease = 0;
     dhcp_time_secs_t	lease_time_expiry = 0;
     int			len;
     int			max_packet;
-    dhcp_lease_t	min_lease = min_lease_length;
-    dhcp_lease_t	max_lease = max_lease_length;
+    dhcp_lease_t	min_lease;
+    dhcp_lease_t	max_lease;
     boolean_t		modified = FALSE;
     dhcpoa_t		options;
     boolean_t		orphan = FALSE;
     struct dhcp *	reply = NULL;
     dhcp_msgtype_t	reply_msgtype = dhcp_msgtype_none_e;
     struct dhcp *	rq = request->pkt;
-    u_char		scratch_idstr[128];
-    u_char		scratch_hwstr[sizeof(rq->dp_chaddr) * 3];
-    id 			subnet = nil;
+    char		scratch_idstr[128];
+    char		scratch_hwstr[sizeof(rq->dp_chaddr) * 3];
+    SubnetRef 		subnet = NULL;
     dhcp_lease_t *	suggested_lease = NULL;
     dhcp_cstate_t	state = dhcp_cstate_none_e;
     char		txbuf[2048];
@@ -627,17 +597,26 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
     /* check for a client identifier */
     cid = dhcpol_find(request->options_p, dhcptag_client_identifier_e, 
 		      &cid_len, NULL);
-    if (cid && cid_len > 1) {
-	/* use the client identifier as provided */
-	cid_type = *((char *)cid);
-	cid_len--;
-	cid++;
+    if (cid != NULL) {
+	if (cid_len > 1) {
+	    /* use the client identifier as provided */
+	    cid_type = *((char *)cid);
+	    cid_len--;
+	    cid++;
+	}
+	else {
+	    cid = NULL;
+	}
     }
-    else {
+    if (cid == NULL
+	|| (dhcp_ignore_client_identifier && rq->dp_hlen != 0)) {
 	/* use the hardware address as the identifier */
 	cid = rq->dp_chaddr;
 	cid_type = rq->dp_htype;
 	cid_len = rq->dp_hlen;
+    }
+    if (cid_len == 0) {
+	goto no_reply;
     }
     idstr = identifierToStringWithBuffer(cid_type, cid, cid_len,
 					 scratch_idstr, sizeof(scratch_idstr));
@@ -680,21 +659,22 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 	match.ciaddr = rq->dp_ciaddr;
 	match.has_binding = FALSE;
 
-	/* identifier is a h/w address - check for a permanent binding */
-	entry = NICache_lookup_hw(&cache, request->time_in_p, 
-				  cid_type, cid, cid_len,
-				  subnet_match, &match,
-				  &domain, &iaddr);
-	if (match.has_binding == TRUE) {
-	    has_binding = TRUE;
-	}
-	if (entry) {
+	if (bootp_getbyhw_file(cid_type, cid, cid_len,
+			       subnet_match, &match, &iaddr,
+			       &hostname, NULL)
+	    || ((use_open_directory == TRUE)
+		&& bootp_getbyhw_ds(cid_type, cid, cid_len,
+				    subnet_match, &match, &iaddr,
+				    &hostname, NULL))) {
 	    binding = dhcp_binding_permanent_e;
 	    lease_time_expiry = DHCP_INFINITE_TIME;
 	}
+	if (match.has_binding == TRUE) {
+	    has_binding = TRUE;
+	}
     }
 
-    if (entry == NULL) {
+    if (binding == dhcp_binding_none_e) {
 	boolean_t		some_binding = FALSE;
 	subnet_match_args_t	match;
 
@@ -710,9 +690,11 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 	if (some_binding == TRUE) {
 	    has_binding = TRUE;
 	}
-	if (entry) {
-	    subnet = [subnets entry:iaddr];
-	    if (subnet == nil) {
+	if (entry != NULL) {
+	    if (subnets != NULL) {
+		subnet = SubnetListGetSubnetForAddress(subnets, iaddr, TRUE);
+	    }
+	    if (subnet == NULL || SubnetDoesAllocate(subnet) == FALSE) {
 		S_remove_host(&entry);
 		my_log(LOG_INFO, "dhcpd: removing %s binding for %s",
 		       idstr, inet_ntoa(iaddr));
@@ -720,30 +702,21 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 		entry = NULL;
 	    }
 	    else {
-		domain = [subnets domain];
 		binding = dhcp_binding_temporary_e;
 		lease_time_expiry = S_lease_time_expiry(&entry->pl);
 		PLCache_make_head(&S_leases.list, entry);
 	    }
 	}
     }
-    if (entry) {
-	subnet = [subnets entry:iaddr];
-	lease_from_subnet(subnet, &min_lease, &max_lease);
-	hostname = ni_valforprop(&entry->pl, NIPROP_NAME);
-	if (hostname)
-	    hostname = strdup(hostname);
-#if 0
-	bootfile = ni_valforprop(&entry->pl, NIPROP_BOOTFILE);
-	if (bootfile)
-	    bootfile = strdup(bootfile);
-#endif 0
+    if (binding != dhcp_binding_none_e) {
 	/* client is already bound on this subnet */
 	if (lease_time_expiry == DHCP_INFINITE_TIME) {
 	    /* permanent entry */
 	    lease = DHCP_INFINITE_LEASE;
 	}
 	else {
+	    max_lease = SubnetGetMaxLease(subnet);
+	    min_lease = SubnetGetMinLease(subnet);
 	    if (suggested_lease) {
 		lease = dhcp_lease_ntoh(*suggested_lease);
 		if (lease > max_lease)
@@ -768,7 +741,8 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 
 	  { /* delete the pending host entry */
 	      struct hosts *	hp;
-	      hp = hostbyaddr(S_pending_hosts, cid_type, cid, cid_len);
+	      hp = hostbyaddr(S_pending_hosts, cid_type, cid, cid_len,
+			      NULL, NULL);
 	      if (hp)
 		  hostfree(&S_pending_hosts, hp);
 	  }
@@ -784,21 +758,24 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 	      /* allocate a new ip address */
 	      subnet = acquire_ip(rq->dp_giaddr, 
 				  request->if_p, request->time_in_p, &iaddr);
-	      if (subnet == nil) {
+	      if (subnet == NULL) {
 		  if (DHCPLeases_reclaim(&S_leases, request->if_p, 
 					 rq->dp_giaddr, 
 					 request->time_in_p, &iaddr)) {
-		      subnet = [subnets entry:iaddr];
+		      if (subnets != NULL) {
+			  subnet = SubnetListGetSubnetForAddress(subnets, iaddr,
+								 TRUE);
+		      }
 		  }
-		  if (subnet == nil) {
+		  if (subnet == NULL) {
 		      if (debug) {
 			  printf("no ip addresses\n");
 		      }
 		      goto no_reply; /* out of ip addresses */
 		  }
 	      }
-	      lease_from_subnet(subnet, &min_lease, &max_lease);
-	      domain = [subnets domain];
+	      max_lease = SubnetGetMaxLease(subnet);
+	      min_lease = SubnetGetMinLease(subnet);
 	      if (suggested_lease) {
 		  lease = dhcp_lease_ntoh(*suggested_lease);
 		  if (lease > max_lease)
@@ -815,7 +792,7 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 
 	      hp = hostadd(&S_pending_hosts, request->time_in_p, 
 			   cid_type, cid, cid_len,
-			   &iaddr, hostname, NULL);
+			   &iaddr, NULL, NULL);
 	      if (hp == NULL)
 		  goto no_reply;
 	      hp->lease = lease;
@@ -847,7 +824,7 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 	  break;
       }
       case dhcp_msgtype_request_e: {
-	  u_char * 		nak = NULL;
+	  const char * 		nak = NULL;
 	  int			optlen;
 	  struct in_addr * 	req_ip;
 	  struct in_addr * 	server_id;
@@ -860,7 +837,8 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 			  &optlen, NULL);
 	  if (server_id) { /* SELECT */
 	      struct hosts *	hp = hostbyaddr(S_pending_hosts, cid_type,
-						cid, cid_len);
+						cid, cid_len,
+						NULL, FALSE);
 	      if (debug)
 		  printf("SELECT\n");
 	      state = dhcp_cstate_select_e;
@@ -885,10 +863,10 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 		  }
 		  goto no_reply;
 	      }
-	      
-	      if (entry == NULL && hp == NULL) {
+	      if (binding == dhcp_binding_none_e && hp == NULL) {
 		  goto no_reply;
 	      }
+	      
 	      if (hp) {
 		  iaddr = hp->iaddr;
 		  if (hp->lease == DHCP_INFINITE_LEASE)
@@ -898,12 +876,6 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 			  = hp->lease + request->time_in_p->tv_sec;
 		  }
 		  lease = hp->lease;
-		  if (hp->hostname) {
-		      if (hostname) {
-			  free(hostname);
-		      }
-		      hostname = strdup(hp->hostname);
-		  }
 	      }
 	      else {
 		  /* this case only happens if the client sends 
@@ -911,7 +883,7 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 		   * but we have a binding 
 		   */
 
-		  /* iaddr, lease_time_expiry, hostname, lease
+		  /* iaddr, lease_time_expiry, lease
 		   * are all set above 
 		   */
 	      }
@@ -938,32 +910,27 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 		      goto reply;
 		  goto no_reply;
 	      }
-	      if (hostname_opt && hostname_opt_len > 0) {
-		  if (binding == dhcp_binding_temporary_e) {
-		      if (hostname)
-			  free(hostname);
-		      hostname = S_get_hostname(hostname_opt, 
-						hostname_opt_len);
-		      ni_set_prop(&entry->pl, NIPROP_NAME, hostname, 
-				  &modified);
-		  }
-		  else if (hostname == NULL) {
-		      hostname = S_get_hostname(hostname_opt, 
-						hostname_opt_len);
-		  }
-	      }
 	      if (binding != dhcp_binding_none_e) {
 		  if (binding == dhcp_binding_temporary_e) {
+		      if (hostname_opt && hostname_opt_len > 0) {
+			  char *	h;
+
+			  h = S_get_hostname(hostname_opt, 
+					     hostname_opt_len);
+			  ni_set_prop(&entry->pl, NIPROP_NAME, h, &modified);
+			  free(h);
+		      }
 		      S_set_lease(&entry->pl, lease_time_expiry, &modified);
 		  }
 	      }
 	      else { /* create a new host entry */
-		  id subnet;
-
-		  subnet = [subnets entry:iaddr];
-		  domain = [subnet domain];
-		  if (subnet == nil
-		      || S_create_host(idstr, hwstr, iaddr, hostname,
+		  if (subnets != NULL) {
+		      subnet = SubnetListGetSubnetForAddress(subnets, iaddr,
+							     TRUE);
+		  }
+		  if (subnet == NULL
+		      || S_create_host(idstr, hwstr, iaddr, 
+				       hostname_opt, hostname_opt_len,
 				       lease_time_expiry) == FALSE) {
 		      reply = make_dhcp_nak((struct dhcp *)txbuf, 
 					    max_packet,
@@ -1057,14 +1024,13 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 	      }
 	      else {
 		  if (hostname_opt && hostname_opt_len > 0) {
-		      if (hostname) {
-			  free(hostname);
-		      }
-		      hostname = S_get_hostname(hostname_opt, 
-						hostname_opt_len);
-		      ni_set_prop(&entry->pl, NIPROP_NAME, hostname, 
-				  &modified);
+		      char * h;
+		      h = S_get_hostname(hostname_opt, hostname_opt_len);
+		      ni_set_prop(&entry->pl, NIPROP_NAME, h, &modified);
+		      free(h);
 		  }
+		  max_lease = SubnetGetMaxLease(subnet);
+		  min_lease = SubnetGetMaxLease(subnet);
 		  if (suggested_lease) {
 		      lease = dhcp_lease_ntoh(*suggested_lease);
 		      if (lease > max_lease)
@@ -1115,6 +1081,7 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 	      lease = dhcp_lease_hton(lease);
 	  else
 	      lease = dhcp_lease_hton(lease_prorate(lease));
+
 	  reply = make_dhcp_reply((struct dhcp *)txbuf, max_packet,
 				  if_inet_addr(request->if_p),
 				  reply_msgtype = dhcp_msgtype_ack_e,
@@ -1217,42 +1184,25 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
     if (reply) {
 	if (reply_msgtype == dhcp_msgtype_ack_e || 
 	    reply_msgtype == dhcp_msgtype_offer_e) {
-	    int		num_added;
-	    int		num_params;
-	    u_char *	params;
+	    int			num_added;
+	    int			num_params;
+	    const uint8_t *	params;
 
-	    params = (char *) dhcpol_find(request->options_p, 
-					  dhcptag_parameter_request_list_e,
-					  &num_params, NULL);
+	    params = (const uint8_t *)
+		dhcpol_find(request->options_p, 
+			    dhcptag_parameter_request_list_e,
+			    &num_params, NULL);
 
 	    bzero(reply->dp_file, sizeof(reply->dp_file));
 
 	    reply->dp_siaddr = if_inet_addr(request->if_p);
-	    strcpy(reply->dp_sname, server_name);
+	    strcpy((char *)reply->dp_sname, server_name);
 
 	    /* add the client-specified parameters */
-	    if (params)
-		num_added = add_subnet_options(domain, hostname, iaddr, 
+	    if (params != NULL)
+		num_added = add_subnet_options(hostname, iaddr, 
 					       request->if_p, 
 					       &options, params, num_params);
-	    if (bootfile) {
-#if 0
-		char 	file[PATH_MAX];
-#endif 0
-		if (bootp_add_bootfile(rq->dp_file, hostname, bootfile,
-				       reply->dp_file, sizeof(reply->dp_file))
-		    == FALSE)
-		    goto no_reply;
-#if 0		
-		if (dhcpoa_add(&options, dhcptag_bootfile_name_e
-			       strlen(file), file) != dhcpoa_success_e) {
-		    my_log(LOG_INFO, "couldn't add bootfile name option: %s",
-			   dhcpoa_err(&options));
-		    goto no_reply;
-		}
-#endif 0
-	    }
-
 	    /* terminate the options */
 	    if (dhcpoa_add(&options, dhcptag_end_e, 0, NULL)
 		!= dhcpoa_success_e) {
@@ -1275,6 +1225,11 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 	    }
 	    if (sendreply(request->if_p, (struct bootp *)reply, size, 
 			  use_broadcast, &iaddr)) {
+		if (hostname == NULL && entry != NULL) {
+		    hostname = ni_valforprop(&entry->pl, NIPROP_NAME);
+		    if (hostname != NULL)
+			hostname = strdup(hostname);
+		}
 		my_log(LOG_INFO, "%s sent %s %s pktsize %d",
 		       dhcp_msgtype_names(reply_msgtype),
 		       (hostname != NULL) 
@@ -1284,9 +1239,7 @@ dhcp_request(request_t * request, dhcp_msgtype_t msgtype,
 	}
     }
  no_reply:
-    if (bootfile)
-	free(bootfile);
-    if (hostname)
+    if (hostname != NULL)
 	free(hostname);
     if (idstr != scratch_idstr)
 	free(idstr);

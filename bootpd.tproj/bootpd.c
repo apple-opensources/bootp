@@ -21,7 +21,7 @@
  * @APPLE_LICENSE_HEADER_END@
  */
 /*
- * bootpd.m
+ * bootpd.c
  * - BOOTP/DHCP server main
  * - see RFC951, RFC2131, RFC2132 for details on the BOOTP protocol, 
  *   BOOTP extensions/DHCP options, and the DHCP protocol
@@ -62,10 +62,6 @@
  * - eliminated ability to read host entries from a file
  */
 
-#ifndef BIND_8_COMPAT
-#define BIND_8_COMPAT
-#endif BIND_8_COMPAT
-
 #include <unistd.h>
 #include <stdlib.h>
 #include <sys/stat.h>
@@ -95,13 +91,19 @@
 #include <arpa/nameser.h>
 #include <sys/uio.h>
 #include <resolv.h>
+#include <CoreFoundation/CFString.h>
+#include <CoreFoundation/CFNumber.h>
+#include <CoreFoundation/CFArray.h>
+#include <CoreFoundation/CFDictionary.h>
+#include <SystemConfiguration/SCValidation.h>
 
 #include "arp.h"
 #include "netinfo.h"
 #include "interfaces.h"
 #include "inetroute.h"
-#import "subnetDescr.h"
+#include "subnets.h"
 #include "dhcp_options.h"
+#include "DNSNameList.h"
 #include "rfc_options.h"
 #include "macNC.h"
 #include "bsdpd.h"
@@ -111,15 +113,24 @@
 #include "bootpd.h"
 #include "bsdp.h"
 #include "bootp_transmit.h"
+#include "util.h"
+#include "cfutil.h"
+#include "bootpd-plist.h"
+#include "bootpdfile.h"
+#include "bootplookup.h"
 
+#define CFGPROP_DHCP_IGNORE_CLIENT_IDENTIFIER	"dhcp_ignore_client_identifier"
 #define CFGPROP_DETECT_OTHER_DHCP_SERVER	"detect_other_dhcp_server"
 #define CFGPROP_BOOTP_ENABLED		"bootp_enabled"
 #define CFGPROP_DHCP_ENABLED		"dhcp_enabled"
 #define CFGPROP_OLD_NETBOOT_ENABLED	"old_netboot_enabled"
 #define CFGPROP_NETBOOT_ENABLED		"netboot_enabled"
+#define CFGPROP_RELAY_ENABLED		"relay_enabled"
 #define CFGPROP_ALLOW			"allow"
 #define CFGPROP_DENY			"deny"
 #define CFGPROP_REPLY_THRESHOLD_SECONDS	"reply_threshold_seconds"
+#define CFGPROP_RELAY_IP_LIST		"relay_ip_list"
+#define CFGPROP_USE_OPEN_DIRECTORY	"use_open_directory"
 
 /* local defines */
 #define	MAXIDLE			(5*60)	/* we hang around for five minutes */
@@ -129,40 +140,39 @@
 #define SERVICE_DHCP		0x00000002
 #define SERVICE_OLD_NETBOOT	0x00000004
 #define SERVICE_NETBOOT		0x00000008
+#define SERVICE_RELAY		0x00000010
 
 /* global variables: */
 char		boot_tftp_dir[128] = "/private/tftpboot";
 int		bootp_socket = -1;
-NICache_t	cache;
 int		debug = 0;
-int		detect_other_dhcp_server = 0;
-NIDomain_t *	ni_local = NULL; /* local netinfo domain */
-NIDomainList_t	niSearchDomains;
+bool		detect_other_dhcp_server = FALSE;
+bool		dhcp_ignore_client_identifier = FALSE;
 int		quiet = 0;
-u_int16_t	reply_threshold_seconds = 0;
-unsigned char	rfc_magic[4] = RFC_OPTIONS_MAGIC;
+uint32_t	reply_threshold_seconds = 0;
 unsigned short	server_priority = BSDP_PRIORITY_BASE;
 char *		testing_control = "";
 char		server_name[MAXHOSTNAMELEN + 1];
-id		subnets = nil;
+SubnetListRef	subnets;
 char 		transmit_buffer[2048];
+bool		use_open_directory = TRUE;
 int		verbose = 0;
 
 /* local types */
 
 /* local variables */
 static boolean_t		S_bootfile_noexist_reply = TRUE;
-static unsigned long		S_cache_check_interval = 30; /* seconds */
-static PropList_t		S_config_dhcp;
-static boolean_t		S_do_bootp = TRUE;
+static boolean_t		S_do_bootp;
 static boolean_t		S_do_netboot;
 static boolean_t		S_do_dhcp;
 static boolean_t		S_do_old_netboot;
-static boolean_t		S_netinfo_host = FALSE;
+static boolean_t		S_do_relay;
 static ptrlist_t		S_domain_list;
 static struct in_addr *		S_dns_servers = NULL;
 static int			S_dns_servers_count = 0;
 static char *			S_domain_name = NULL;
+static uint8_t *		S_domain_search = NULL;
+static int			S_domain_search_size = 0;
 static ptrlist_t		S_if_list;
 static interface_list_t *	S_interfaces;
 static inetroute_list_t *	S_inetroutes = NULL;
@@ -177,6 +187,10 @@ static int			S_allow_count = 0;
 static struct ether_addr *	S_deny = NULL;
 static int			S_deny_count = 0;
 static int			S_persist = 0;
+static struct in_addr *		S_relay_ip_list = NULL;
+static int			S_relay_ip_list_count = 0;
+static int			S_max_hops = 4;
+
 
 void
 my_log(int priority, const char *message, ...)
@@ -199,88 +213,12 @@ my_log(int priority, const char *message, ...)
     return;
 }
 
-/*
- * PropList_t routines
- */
-
-int
-PropList_instance(PropList_t * pl_p)
-{
-    return (pl_p->instance);
-}
-
-void
-PropList_free(PropList_t * pl_p)
-{
-    if (pl_p == NULL)
-	return;
-    ni_name_free(&pl_p->path);
-    ni_proplist_free(&pl_p->pl);
-    bzero(pl_p, sizeof(*pl_p));
-    return;
-}
-
-void 
-PropList_init(PropList_t * pl_p, ni_name path)
-{
-    bzero(pl_p, sizeof(*pl_p));
-    NI_INIT(&pl_p->pl);
-    pl_p->path = ni_name_dup(path);
-}
-
-boolean_t
-PropList_read(PropList_t * pl_p)
-{
-    ni_status	status;
-    ni_id	dir_id = {0,0};
-    
-    status = ni_pathsearch(NIDomain_handle(ni_local), &dir_id, pl_p->path);
-    if (status != NI_OK) {
-	my_log(LOG_INFO, "ni_pathsearch '%s' failed: %s",
-	       pl_p->path, ni_error(status));
-	ni_proplist_free(&pl_p->pl);
-	bzero(&pl_p->dir_id, sizeof(pl_p->dir_id));
-	pl_p->instance++;
-	return (FALSE);
-    }
-    if (bcmp(&dir_id, &pl_p->dir_id, sizeof(dir_id))) {
-	/* directory was modified - re-read */
-	ni_proplist_free(&pl_p->pl);
-	bzero(&pl_p->dir_id, sizeof(pl_p->dir_id));
-	pl_p->instance++;
-	status = ni_read(NIDomain_handle(ni_local), &dir_id, &pl_p->pl);
-	if (status != NI_OK) {
-	    my_log(LOG_INFO, "ni_read '%s' failed: %s",
-		   pl_p->path, ni_error(status));
-	    return (FALSE);
-	}
-	pl_p->dir_id = dir_id;
-    }
-    return (TRUE);
-}
-
-ni_namelist *
-PropList_lookup(PropList_t * pl_p, ni_name propname)
-{
-    int i;
-
-    for (i = 0; i < pl_p->pl.nipl_len; i++) {
-	ni_property * p = &(pl_p->pl.nipl_val[i]);
-	if (strcmp(propname, p->nip_name) == 0) {
-	    return (&p->nip_val);
-	}
-    }
-    return (NULL);
-}
-
 /* forward function declarations */
 static int 		issock(int fd);
 static void		on_alarm(int sigraised);
 static void		on_sighup(int sigraised);
 static void		bootp_request(request_t * request);
 static void		S_server_loop();
-static void		S_relay_loop(struct in_addr * relay, int max_hops);
-
 
 #define PID_FILE "/var/run/bootpd.pid"
 static void
@@ -323,188 +261,11 @@ background()
     }
 }
 
-#if 0
-static __inline__ boolean_t
-is_this_our_name(interface_list_t * list, char * name)
-{
-    struct hostent * h;
-
-    h = gethostbyname(name);
-    if (h && h->h_addr_list && *h->h_addr_list) {
-	struct in_addr * * a = (struct in_addr * *)h->h_addr_list;
-	while (*a) {
-	    if (ifl_find_ip(list, **a)) {
-		return (TRUE);
-	    }
-	    a++;
-	}
-    }
-    return (FALSE);
-}
-
-#define NIPROP_MASTER		"master"
-
-void
-setMaster(NIDomain_t * domain, interface_list_t * list)
-{
-    ni_id		dir;
-    ni_namelist		nl;
-    u_char *		slash;
-    ni_status		status;
-
-    if (domain == NULL || list == NULL)
-	return;
-
-    status = ni_pathsearch(NIDomain_handle(domain), &dir, "/");
-    if (status != NI_OK)
-	return;
-    
-    NI_INIT(&nl);
-    status = ni_lookupprop(NIDomain_handle(domain), &dir, NIPROP_MASTER, &nl);
-    if (status != NI_OK)
-	return;
-
-    if (nl.ninl_len && (slash = strchr(nl.ninl_val[0], '/'))) {
-	int		len;
-	u_char		tmp[256];
-
-	len = slash - (u_char *) nl.ninl_val[0];
-	strncpy(tmp, nl.ninl_val[0], len);
-	tmp[len] = '\0';
-	NIDomain_set_master(domain, is_this_our_name(list, tmp));
-    }
-    ni_namelist_free(&nl);
-    return;
-}
-#endif 0
-
-/*
- * Function: S_ni_domains_init
- *
- * Purpose:
- *   Given the list of domain paths in S_domain_list,
- *   open a connection to it, and store the NIDomain object
- *   in the niSearchDomain list.
- *   The code makes sure it only opens each domain once by
- *   checking for uniqueness of the host/tag combination.
- *   The code also pays attention to the the special path "...",
- *   which means open the hierarchy starting from the local domain
- *   on up.
- */
-static boolean_t
-S_ni_domains_init()
-{
-    boolean_t	hierarchy_done = FALSE;
-    int 	i;
-
-    NICache_init(&cache, S_cache_check_interval);
-    NIDomainList_init(&niSearchDomains);
-    ni_local = NULL;
-
-    for (i = 0; i < ptrlist_count(&S_domain_list); i++) {
-	NIDomain_t * 	domain;
-	u_char *   	dstr = (u_char *)ptrlist_element(&S_domain_list, i);
-
-	if (strcmp(dstr, DOMAIN_HIERARCHY) == 0) {
-	    NIDomain_t * domain;
-
-	    if (hierarchy_done)
-		continue;
-	    hierarchy_done = TRUE;
-	    my_log(LOG_DEBUG, 
-		   "opening hierarchy starting at " NI_DOMAIN_LOCAL);
-	    domain = NIDomain_init(NI_DOMAIN_LOCAL);
-#if 0
-	    setMaster(domain, S_interfaces);
-#endif 0
-	    while (TRUE) {
-		NIDomain_t * obj;
-
-		if (domain == NULL)
-		    break; /* we're done */
-		obj = NIDomainList_find(&niSearchDomains, domain);
-		if (obj != NULL) {
-		    if (debug)
-			printf("%s/%s already in the list: %s\n",
-			       NIDomain_tag(obj), inet_ntoa(NIDomain_ip(obj)),
-			       NIDomain_name(obj));
-		    NIDomain_free(obj);
-		    domain = obj;
-		}
-		else {
-		    my_log(LOG_DEBUG, "opened domain %s/%s", 
-			   inet_ntoa(NIDomain_ip(domain)),
-			   NIDomain_tag(domain));
-		    NIDomainList_add(&niSearchDomains, domain);
-		    NICache_add_domain(&cache, domain);
-		}
-		domain = NIDomain_parent(domain);
-#if 0
-		setMaster(domain, S_interfaces);
-#endif 0
-	    }
-	}
-	else {
-	    my_log(LOG_DEBUG, "opening domain %s", dstr);
-	    domain = NIDomain_init(dstr);
-
-	    if (domain != NULL) {
-		if (NIDomainList_find(&niSearchDomains, domain)
-		    != NULL) {
-		    /* already in the list */
-		    if (debug) {
-			printf("%s/%s already in the list\n",
-			       inet_ntoa(NIDomain_ip(domain)),
-			       NIDomain_tag(domain)); 
-		    }
-		    NIDomain_free(domain);
-		    continue;
-		}
-#if 0
-		setMaster(domain, S_interfaces);
-#endif 0
-		NIDomainList_add(&niSearchDomains, domain);
-		NICache_add_domain(&cache, domain);
-		my_log(LOG_DEBUG, "opened domain %s/%s", 
-		       inet_ntoa(NIDomain_ip(domain)),
-		       NIDomain_tag(domain));
-	    }
-	    else {
-		my_log(LOG_INFO, "unable to open domain '%s'", dstr);
-	    }
-	}
-    }
-    { /* find the "local" netinfo domain */
-	int i;
-
-	for (i = 0; i < NIDomainList_count(&niSearchDomains); i++) {
-	    NIDomain_t * domain = NIDomainList_element(&niSearchDomains, i);
-	    if (ifl_find_ip(S_interfaces, NIDomain_ip(domain))
-		&& strcmp(NIDomain_tag(domain), "local") == 0) {
-		ni_local = domain;
-		break;
-	    }
-	}
-	if (ni_local == NULL) {
-	    ni_local = NIDomain_init(NI_DOMAIN_LOCAL);
-#if 0
-	    setMaster(ni_local, S_interfaces);
-#endif 0
-
-	    if (ni_local == NULL)
-		exit(1);
-	    my_log(LOG_INFO, 
-		   "opened local netinfo domain");
-	}
-    }
-    
-    return (TRUE);
-}
-
 static void
 S_get_dns()
 {
-    int i;
+    int		domain_search_count = 0;
+    int 	i;
 
     res_init(); /* figure out the default dns servers */
 
@@ -513,6 +274,13 @@ S_get_dns()
 	free(S_dns_servers);
 	S_dns_servers = NULL;
     }
+    if (S_domain_search != NULL) {
+	free(S_domain_search);
+	S_domain_search = NULL;
+    }
+    S_domain_search_size = 0;
+
+    /* create the DNS server address list */
     S_dns_servers_count = _res.nscount;
     if (S_dns_servers_count == 1) {
       if (_res.nsaddr_list[0].sin_addr.s_addr == 0)
@@ -521,15 +289,44 @@ S_get_dns()
     if (S_dns_servers_count) {
 	S_dns_servers = (struct in_addr *)malloc(sizeof(*S_dns_servers) 
 						 * S_dns_servers_count);
+	for (i = 0; i < S_dns_servers_count; i++) {
+	    S_dns_servers[i] = _res.nsaddr_list[i].sin_addr;
+	    if (debug) {
+		if (i == 0) {
+		    printf("DNS servers:");
+		}
+		printf(" %s", inet_ntoa(S_dns_servers[i]));
+	    }
+	}
+	if (debug) {
+	    printf("\n");
+	}
 	if (_res.defdname[0] && strcmp(_res.defdname, "local") != 0) {
 	    S_domain_name = _res.defdname;
 	    if (debug)
-		printf("%s\n", S_domain_name);
+		printf("DNS domain: %s\n", S_domain_name);
 	}
-	for (i = 0; i < S_dns_servers_count; i++) {
-	    S_dns_servers[i] = _res.nsaddr_list[i].sin_addr;
-	    if (debug)
-		printf("DNS %s\n", inet_ntoa(S_dns_servers[i]));
+	/* create the DNS search list */
+	for (i = 0; i < MAXDNSRCH; i++) {
+	    if (_res.dnsrch[i] == NULL) {
+		break;
+	    }
+	    domain_search_count++;
+	    if (debug) {
+		if (i == 0) {
+		    printf("DNS search:");
+		}
+		printf(" %s", _res.dnsrch[i]);
+	    }
+	}
+	if (domain_search_count != 0) {
+	    if (debug) {
+		printf("\n");
+	    }
+	    S_domain_search 
+		= DNSNameListBufferCreate((const char * *)_res.dnsrch,
+					  domain_search_count,
+					  NULL, &S_domain_search_size);
 	}
     }
     return;
@@ -543,12 +340,12 @@ S_get_dns()
  *   in the list.
  */
 static boolean_t
-S_string_in_list(ptrlist_t * list, u_char * str)
+S_string_in_list(ptrlist_t * list, const char * str)
 {
     int i;
 
     for (i = 0; i < ptrlist_count(list); i++) {
-	u_char * lstr = (u_char *)ptrlist_element(list, i);
+	char * lstr = (char *)ptrlist_element(list, i);
 	if (strcmp(str, lstr) == 0)
 	    return (TRUE);
     }
@@ -613,7 +410,6 @@ S_get_interfaces()
     }
     ifl_free(&S_interfaces);
     S_interfaces = new_list;
-    S_log_interfaces();
     return;
 }
 
@@ -641,30 +437,58 @@ S_get_network_routes()
 }
 
 static void
-S_service_enable(ni_namelist * nl_p, u_int32_t which)
+S_service_enable(CFTypeRef prop, u_int32_t which)
 {
     int 	i;
+    CFStringRef	ifname_cf = NULL;
     int		count;
-    char * *	list;
 
-    if (nl_p == NULL) {
+    if (prop == NULL) {
 	return;
     }
-    if (nl_p->ninl_len == 0) {
-	S_which_services |= which;
+    if (isA_CFBoolean(prop) != NULL) {
+	if (CFEqual(prop, kCFBooleanTrue)) {
+	    S_which_services |= which;
+	}
 	return;
     }
-    list = nl_p->ninl_val;
-    count = nl_p->ninl_len;
+    if (isA_CFString(prop) != NULL) {
+	count = 1;
+	ifname_cf = prop;
+    }
+    else if (isA_CFArray(prop) != NULL) {
+	count = CFArrayGetCount(prop);
+	if (count == 0) {
+	    S_which_services |= which;
+	    return;
+	}
+    }
+    else {
+	/* invalid type */
+	return;
+    }
     for (i = 0; i < count; i++) {
 	interface_t * 	if_p;
-	char *		ifname = list[i];
+	char		ifname[IFNAMSIZ + 1];
 
-	if (ifname == NULL || *ifname == '\0')
+	if (i != 0 || ifname_cf == NULL) {
+	    ifname_cf = CFArrayGetValueAtIndex(prop, i);
+	    if (isA_CFString(ifname_cf) == NULL) {
+		continue;
+	    }
+	}
+	if (CFStringGetCString(ifname_cf, ifname, sizeof(ifname),
+			       kCFStringEncodingASCII)
+	    == FALSE) {
 	    continue;
+	}
+	if (*ifname == '\0') {
+	    continue;
+	}
 	if_p = ifl_find_name(S_interfaces, ifname);
-	if (if_p == NULL)
+	if (if_p == NULL) {
 	    continue;
+	}
 	if_p->user_defined |= which;
     }
     return;
@@ -712,24 +536,36 @@ S_disable_netboot()
 typedef int (*qsort_compare_func_t)(const void *, const void *);
 
 static struct ether_addr *
-S_make_ether_list(ni_namelist * nl_p, int * count_p)
+S_make_ether_list(CFArrayRef array, int * count_p)
 {
+    int			array_count = CFArrayGetCount(array);
     int			count = 0;
     int			i;
     struct ether_addr * list;
 
-    list = (struct ether_addr *)malloc(sizeof(*list) * nl_p->ninl_len);
-    for (i = 0; i < nl_p->ninl_len; i++) {
-	const char *		val = nl_p->ninl_val[i];
+    list = (struct ether_addr *)malloc(sizeof(*list) * array_count);
+    for (i = 0; i < array_count; i++) {
 	struct ether_addr * 	eaddr;
+	CFStringRef		str = CFArrayGetValueAtIndex(array, i);
+	char			val[64];
 
-	if (strlen(val) < 2)
+	if (isA_CFString(str) == NULL) {
 	    continue;
+	}
+	if (CFStringGetCString(str, val, sizeof(val), kCFStringEncodingASCII)
+	    == FALSE) {
+	    continue;
+	}
+	if (strlen(val) < 2) {
+	    continue;
+	}
 	/* ignore ethernet hardware type, if present */
 	if (strncmp(val, "1,", 2) == 0) {
-	    val = val + 2;
+	    eaddr = ether_aton(val + 2);
 	}
-	eaddr = ether_aton((char *)val);
+	else {
+	    eaddr = ether_aton((char *)val);
+	}
 	if (eaddr == NULL) {
 	    continue;
 	}
@@ -759,7 +595,7 @@ S_ok_to_respond(int hwtype, void * hwaddr, int hwlen)
 	search = bsearch(hwaddr, S_deny, S_deny_count, sizeof(*S_deny),
 			 (qsort_compare_func_t)ether_cmp);
 	if (search != NULL) {
-	    my_log(LOG_DEBUG, "%s is in deny list, ignoring\n",
+	    my_log(LOG_DEBUG, "%s is in deny list, ignoring",
 		   ether_ntoa(hwaddr));
 	    respond = FALSE;
 	}
@@ -768,7 +604,7 @@ S_ok_to_respond(int hwtype, void * hwaddr, int hwlen)
 	search = bsearch(hwaddr, S_allow, S_allow_count, sizeof(*S_allow),
 			 (qsort_compare_func_t)ether_cmp);
 	if (search == NULL) {
-	    my_log(LOG_DEBUG, "%s is not in the allow list, ignoring\n",
+	    my_log(LOG_DEBUG, "%s is not in the allow list, ignoring",
 		   ether_ntoa(hwaddr));
 	    respond = FALSE;
 	}
@@ -777,9 +613,9 @@ S_ok_to_respond(int hwtype, void * hwaddr, int hwlen)
 }
 
 static void
-S_refresh_allow_deny(PropList_t * pl_p)
+S_refresh_allow_deny(CFDictionaryRef plist)
 {
-    ni_namelist *	nl_p = NULL;
+    CFArrayRef		prop;
 
     if (S_allow != NULL) {
 	free(S_allow);
@@ -792,15 +628,113 @@ S_refresh_allow_deny(PropList_t * pl_p)
     S_allow_count = 0;
     S_deny_count = 0;
 
+    if (plist == NULL) {
+	return;
+    }
+
     /* allow */
-    nl_p = PropList_lookup(&S_config_dhcp, CFGPROP_ALLOW);
-    if (nl_p != NULL && nl_p->ninl_len > 0) {
-	S_allow = S_make_ether_list(nl_p, &S_allow_count);
+    prop = CFDictionaryGetValue(plist, CFSTR(CFGPROP_ALLOW));
+    if (isA_CFArray(prop) != NULL && CFArrayGetCount(prop) > 0) {
+	S_allow = S_make_ether_list(prop, &S_allow_count);
     }
     /* deny */
-    nl_p = PropList_lookup(&S_config_dhcp, CFGPROP_DENY);
-    if (nl_p != NULL && nl_p->ninl_len > 0) {
-	S_deny = S_make_ether_list(nl_p, &S_deny_count);
+    prop = CFDictionaryGetValue(plist, CFSTR(CFGPROP_DENY));
+    if (isA_CFArray(prop) != NULL && CFArrayGetCount(prop) > 0) {
+	S_deny = S_make_ether_list(prop, &S_deny_count);
+    }
+    return;
+}
+
+static boolean_t
+S_str_to_ip(const char * ip_str, struct in_addr * ret_ip)
+{
+    if (inet_aton(ip_str, ret_ip) == 0
+	|| ret_ip->s_addr == 0 
+	|| ret_ip->s_addr == INADDR_BROADCAST) {
+	return (FALSE);
+    }
+    return (TRUE);
+}
+
+static void
+S_relay_ip_list_clear(void)
+{
+    if (S_relay_ip_list != NULL) {
+	free(S_relay_ip_list);
+	S_relay_ip_list = NULL;
+	S_relay_ip_list_count = 0;
+    }
+    return;
+}
+
+static void
+S_relay_ip_list_add(struct in_addr relay_ip)
+{
+    if (S_relay_ip_list == NULL) {
+	S_relay_ip_list 
+	    = (struct in_addr *)malloc(sizeof(struct in_addr *));
+	S_relay_ip_list[0] = relay_ip;
+	S_relay_ip_list_count = 1;
+    }
+    else {
+	S_relay_ip_list_count++;
+	S_relay_ip_list = (struct in_addr *)
+	    realloc(S_relay_ip_list,
+		    sizeof(struct in_addr *) * S_relay_ip_list_count);
+	S_relay_ip_list[S_relay_ip_list_count - 1] = relay_ip;
+    }
+    return;
+}
+
+static void
+S_update_relay_ip_list(CFArrayRef list)
+{
+    int		count;
+    int		i;
+
+    count = CFArrayGetCount(list);
+    S_relay_ip_list_clear();
+    for (i = 0; i < count; i++) {
+	struct in_addr	relay_ip;
+	CFStringRef	str = CFArrayGetValueAtIndex(list, i);
+		
+	if (isA_CFString(str) == NULL) {
+	    continue;
+	}
+	if (my_CFStringToIPAddress(str, &relay_ip) == FALSE) {
+	    my_log(LOG_NOTICE, "Invalid relay server ip address");
+	    continue;
+	}
+	if (relay_ip.s_addr == 0 || relay_ip.s_addr == INADDR_BROADCAST) {
+	    my_log(LOG_NOTICE, 
+		   "Invalid relay server ip address %s",
+		   inet_ntoa(relay_ip));
+	    continue;
+	}
+	if (ifl_find_ip(S_interfaces, relay_ip) != NULL) {
+	    my_log(LOG_NOTICE, 
+		   "Relay server ip address %s specifies this host",
+		   inet_ntoa(relay_ip));
+	    continue;
+	}
+	S_relay_ip_list_add(relay_ip);
+    }
+    return;
+}
+
+__private_extern__ void
+set_number_from_plist(CFDictionaryRef plist, CFStringRef prop_name_cf,
+		      const char * prop_name, uint32_t * val_p)
+{
+    CFTypeRef	prop;
+
+    if (plist == NULL) {
+	return;
+    }
+    prop = CFDictionaryGetValue(plist, prop_name_cf);
+    if (prop != NULL
+	&& my_CFTypeToNumber(prop, val_p) == FALSE) {
+	my_log(LOG_INFO, "Invalid '%s' property", prop_name);
     }
     return;
 }
@@ -808,54 +742,106 @@ S_refresh_allow_deny(PropList_t * pl_p)
 static void
 S_update_services()
 {
-    ni_namelist *	nl_p = NULL;
+    uint32_t		num;
+    CFDictionaryRef	plist = NULL;
+    CFTypeRef		prop;
 
+    plist = my_CFPropertyListCreateFromFile("/etc/bootpd.plist");
     S_which_services = 0;
 
-    PropList_read(&S_config_dhcp);
+    if (isA_CFDictionary(plist) != NULL) {
+	/* BOOTP */
+	S_service_enable(CFDictionaryGetValue(plist,
+					      CFSTR(CFGPROP_BOOTP_ENABLED)),
+			 SERVICE_BOOTP);
+	
+	/* DHCP */
+	S_service_enable(CFDictionaryGetValue(plist,
+					      CFSTR(CFGPROP_DHCP_ENABLED)),
+			 SERVICE_DHCP);
 
-    /* BOOTP */
-    if (S_do_bootp) {
-	nl_p = PropList_lookup(&S_config_dhcp, CFGPROP_BOOTP_ENABLED);
-	if (nl_p == NULL) {
-	    /* if nothing is specified, BOOTP is enabled */
-	    S_which_services |= SERVICE_BOOTP;
-	}
-	else {
-	    S_service_enable(nl_p, SERVICE_BOOTP);
+	/* NetBoot (2.0) */
+	S_service_enable(CFDictionaryGetValue(plist,
+					      CFSTR(CFGPROP_NETBOOT_ENABLED)),
+			 SERVICE_NETBOOT);
+	
+	/* NetBoot (old, pre 2.0) */
+	S_service_enable(CFDictionaryGetValue(plist,
+					      CFSTR(CFGPROP_OLD_NETBOOT_ENABLED)),
+			 SERVICE_OLD_NETBOOT);
+	
+	/* Relay */
+	S_service_enable(CFDictionaryGetValue(plist,
+					      CFSTR(CFGPROP_RELAY_ENABLED)),
+			 SERVICE_RELAY);
+	prop = CFDictionaryGetValue(plist, CFSTR(CFGPROP_RELAY_IP_LIST));
+	if (isA_CFArray(prop) != NULL) {
+	    S_update_relay_ip_list(prop);
 	}
     }
-
-    /* DHCP */
-    S_service_enable(PropList_lookup(&S_config_dhcp, CFGPROP_DHCP_ENABLED),
-		     SERVICE_DHCP);
-
-    /* NetBoot (2.0) */
-    S_service_enable(PropList_lookup(&S_config_dhcp, CFGPROP_NETBOOT_ENABLED),
-		     SERVICE_NETBOOT);
-
-    /* NetBoot (old, pre 2.0) */
-    S_service_enable(PropList_lookup(&S_config_dhcp, 
-				     CFGPROP_OLD_NETBOOT_ENABLED),
-		     SERVICE_OLD_NETBOOT);
-
     /* allow/deny list */
-    S_refresh_allow_deny(&S_config_dhcp);
+    S_refresh_allow_deny(plist);
 
     /* reply threshold */
     reply_threshold_seconds = 0;
-    nl_p = PropList_lookup(&S_config_dhcp, CFGPROP_REPLY_THRESHOLD_SECONDS);
-    if (nl_p != NULL && nl_p->ninl_len != 0) {
-	reply_threshold_seconds = strtoul(nl_p->ninl_val[0], NULL, 0);
-    }
+    set_number_from_plist(plist, CFSTR(CFGPROP_REPLY_THRESHOLD_SECONDS),
+			  CFGPROP_REPLY_THRESHOLD_SECONDS,
+			  &reply_threshold_seconds);
 
     /* detect other DHCP server */
-    detect_other_dhcp_server = 0;
-    nl_p = PropList_lookup(&S_config_dhcp, CFGPROP_DETECT_OTHER_DHCP_SERVER);
-    if (nl_p != NULL && nl_p->ninl_len != 0) {
-	if (strtol(nl_p->ninl_val[0], NULL, 0) != 0) {
-	    detect_other_dhcp_server = 1;
+    detect_other_dhcp_server = FALSE;
+    num = 0;
+    set_number_from_plist(plist, CFSTR(CFGPROP_DETECT_OTHER_DHCP_SERVER),
+			  CFGPROP_DETECT_OTHER_DHCP_SERVER,
+			  &num);
+    if (num != 0) {
+	detect_other_dhcp_server = TRUE;
+    }
+
+    /* ignore the DHCP client identifier */
+    dhcp_ignore_client_identifier = FALSE;
+    num = 0;
+    set_number_from_plist(plist, CFSTR(CFGPROP_DHCP_IGNORE_CLIENT_IDENTIFIER),
+			  CFGPROP_DHCP_IGNORE_CLIENT_IDENTIFIER,
+			  &num);
+    if (num != 0) {
+	dhcp_ignore_client_identifier = TRUE;
+    }
+
+    /* use open directory [for bootpent queries] */
+    use_open_directory = TRUE;
+    num = 1;
+    set_number_from_plist(plist, CFSTR(CFGPROP_USE_OPEN_DIRECTORY),
+			  CFGPROP_USE_OPEN_DIRECTORY,
+			  &num);
+    if (num == 0) {
+	use_open_directory = FALSE;
+    }
+
+    /* get the new list of subnets */
+    SubnetListFree(&subnets);
+    if (plist != NULL) {
+	prop = CFDictionaryGetValue(plist, BOOTPD_PLIST_SUBNETS);
+	if (isA_CFArray(prop) != NULL) {
+	    subnets = SubnetListCreateWithArray(prop);
+	    if (subnets != NULL) {
+		if (debug) {
+		    SubnetListPrint(subnets);
+		}
+	    }
 	}
+    }
+
+    dhcp_init();
+    if (S_do_netboot || S_do_old_netboot
+	|| S_service_is_enabled(SERVICE_NETBOOT | SERVICE_OLD_NETBOOT)) {
+	if (bsdp_init(plist) == FALSE) {
+	    my_log(LOG_INFO, "bootpd: NetBoot service turned off");
+	    S_disable_netboot();
+	}
+    }
+    if (plist != NULL) {
+	CFRelease(plist);
     }
     return;
 }
@@ -865,7 +851,7 @@ bootp_enabled(interface_t * if_p)
 {
     u_int32_t 	which = (S_which_services | if_p->user_defined);
 
-    return ((which & SERVICE_BOOTP) != 0);
+    return (S_do_bootp || (which & SERVICE_BOOTP) != 0);
 }
 
 static __inline__ boolean_t
@@ -892,6 +878,14 @@ old_netboot_enabled(interface_t * if_p)
     return (S_do_old_netboot || (which & SERVICE_OLD_NETBOOT) != 0);
 }
 
+static __inline__ boolean_t
+relay_enabled(interface_t * if_p)
+{
+    u_int32_t 	which = (S_which_services | if_p->user_defined);
+
+    return (S_do_relay || (which & SERVICE_RELAY) != 0);
+}
+
 void
 usage()
 {
@@ -901,7 +895,6 @@ usage()
 	    "[ -D ]	be a DHCP server\n"
 	    "[ -B ]	don't service BOOTP requests\n"
 	    "[ -b ] 	bootfile must exist or we don't respond\n"
-	    "[ -c <cache check interval in seconds> ]\n"
 	    "[ -d ]	debug mode, stay in foreground, extra printf's\n"
 	    "[ -I ]	disable re-initialization on IP address changes\n"
 	    "[ -i <interface> [ -i <interface> ... ] ]\n"
@@ -925,33 +918,32 @@ main(int argc, char * argv[])
     int			ch;
     boolean_t		ip_change_notifications = TRUE;
     int			logopt = LOG_CONS;
-    int			max_hops = 4;
     boolean_t		netinfo_lookups = TRUE;
-    boolean_t		relay = FALSE;
-    struct in_addr	relay_server = { 0 };
+    struct in_addr	relay_ip = { 0 };
 
     debug = 0;			/* no debugging ie. go into the background */
     verbose = 0;		/* don't print extra information */
 
     ptrlist_init(&S_domain_list);
     ptrlist_init(&S_if_list);
-    while ((ch =  getopt(argc, argv, "aBbc:DdhHi:ImNn:o:Pp:qr:t:v")) != EOF) {
+
+    S_get_interfaces();
+
+    while ((ch =  getopt(argc, argv, "aBbc:DdhHi:ImNn:o:Pp:qr:St:v")) != EOF) {
 	switch ((char)ch) {
 	case 'a':
-	    /* enable anonymous binding for BOOTP clients */
-	    S_netinfo_host = TRUE;
+	    /* was: enable anonymous binding for BOOTP clients */
 	    break;
 	case 'B':
-	    S_do_bootp = FALSE;
+	    break;
+	case 'S':
+	    S_do_bootp = TRUE;
 	    break;
 	case 'b':
 	    S_bootfile_noexist_reply = FALSE; 
 	    /* reply only if bootfile exists */
 	    break;
-	case 'c':		    /* cache check interval - seconds */
-	    S_cache_check_interval = strtoul(optarg, NULL, 0);
-	    printf("Using cache check interval %ld seconds\n",
-		   S_cache_check_interval);
+	case 'c':		    /* was: cache check interval - seconds */
 	    break;
 	case 'D':		/* answer DHCP requests as a DHCP server */
 	    S_do_dhcp = TRUE;
@@ -1001,7 +993,7 @@ main(int argc, char * argv[])
 		       optarg);
 		exit(1);
 	    }
-	    max_hops = h;
+	    S_max_hops = h;
 	    break;
 	}
 	case 'P': {
@@ -1017,13 +1009,17 @@ main(int argc, char * argv[])
 	    quiet = 1;
 	    break;
 	case 'r':
-	    relay = TRUE;
-	    if (inet_aton(optarg, &relay_server) == 0
-		|| relay_server.s_addr == 0 
-		|| relay_server.s_addr == INADDR_BROADCAST) {
+	    S_do_relay = 1;
+	    if (S_str_to_ip(optarg, &relay_ip) == FALSE) {
 		printf("Invalid relay server ip address %s\n", optarg);
 		exit(1);
 	    }
+	    if (ifl_find_ip(S_interfaces, relay_ip) != NULL) {
+		printf("Relay server ip address %s specifies this host\n",
+		       optarg);
+		exit(1);
+	    }
+	    S_relay_ip_list_add(relay_ip);
 	    break;
 	case 't': {
 	    testing_control = optarg;
@@ -1076,11 +1072,10 @@ main(int argc, char * argv[])
     if (debug)
 	logopt = LOG_PERROR;
 
-    if (relay)
-	(void) openlog("bootp_relay", logopt | LOG_PID, LOG_DAEMON);
-    else
-	(void) openlog("bootpd", logopt | LOG_PID, LOG_DAEMON);
-	
+    (void) openlog("bootpd", logopt | LOG_PID, LOG_DAEMON);
+
+    SubnetListLogErrors(LOG_NOTICE);
+
     my_log(LOG_DEBUG, "server starting");
 
     { 
@@ -1115,33 +1110,15 @@ main(int argc, char * argv[])
     /* install our sighup handler */
     signal(SIGHUP, on_sighup);
 
-    S_get_interfaces();
-    S_get_network_routes();
-
     if (ip_change_notifications) {
 	S_add_ip_change_notifications();
     }
 
-    if (relay == FALSE) {
-	PropList_init(&S_config_dhcp, "/config/dhcp");
-
-	/* initialize our netinfo search domains */
-	if (ptrlist_count(&S_domain_list) == 0 && netinfo_lookups) {
-	    ptrlist_add(&S_domain_list, DOMAIN_HIERARCHY);
-	}
-	if (S_ni_domains_init() == FALSE) {
-	    my_log(LOG_INFO, "domain initialization failed");
-	    exit (1);
-	}
-	S_update_services();
+    /* initialize our netinfo search domains */
+    if (ptrlist_count(&S_domain_list) == 0 && netinfo_lookups) {
+	ptrlist_add(&S_domain_list, DOMAIN_HIERARCHY);
     }
-
-    if (relay) {
-	S_relay_loop(&relay_server, max_hops);
-    }
-    else {
-	S_server_loop();
-    }
+    S_server_loop();
     exit (0);
 }
 
@@ -1162,13 +1139,18 @@ subnetAddressAndMask(struct in_addr giaddr, interface_t * if_p,
 {
     /* gateway specified, find a subnet description on the same subnet */
     if (giaddr.s_addr) {
-	id subnet;
+	SubnetRef	subnet;
+
 	/* find a subnet entry on the same subnet as the gateway */
-	if (subnets == nil 
-	    || (subnet = [subnets entrySameSubnet:giaddr]) == nil)
+	if (subnets == NULL) {
 	    return (FALSE);
+	}
+	subnet = SubnetListGetSubnetForAddress(subnets, giaddr, FALSE);
+	if (subnet == NULL) {
+	    return (FALSE);
+	}
 	*addr = giaddr;
-	*mask = [subnet mask];
+	*mask = SubnetGetMask(subnet);
     }
     else {
 	*addr = if_inet_netaddr(if_p);
@@ -1309,47 +1291,12 @@ bootp_add_bootfile(const char * request_file, const char * hostname,
 	       len, reply_file_size);
 	return (TRUE);
     }
-
     my_log(LOG_DEBUG, "replyfile %s", path);
     strcpy(reply_file, path);
     return (TRUE);
 }
 
-void
-host_parms_from_proplist(ni_proplist * pl_p, int index, struct in_addr * ip, 
-			 u_char * * name, u_char * * bootfile)
-{
-    ni_name ipstr;
-
-    if (index != -1) {
-	/* retrieve the ip address */
-	if (ip) { /* return the ip address */
-	    ipstr = (ni_nlforprop(pl_p, NIPROP_IP_ADDRESS))->ninl_val[index];
-	    ip->s_addr = inet_addr(ipstr);
-	}
-    }
-
-    /* retrieve the host name */
-    if (name) {
-	ni_name 	str;
-	
-	*name = NULL;
-	str = ni_valforprop(pl_p, NIPROP_NAME);
-	if (str)
-	    *name = ni_name_dup(str);
-    }
-    
-    /* retrieve the bootfile */
-    if (bootfile) {
-	ni_name str;
-	
-	*bootfile = NULL;
-	str = ni_valforprop(pl_p, NIPROP_BOOTFILE);
-	if (str)
-	    *bootfile = ni_name_dup(str);
-    }
-    return;
-}
+#define NIPROP_IP_ADDRESS	"ip_address"
 
 /*
  * Function: ip_address_reachable
@@ -1368,10 +1315,10 @@ ip_address_reachable(struct in_addr ip, struct in_addr giaddr,
 
     if (giaddr.s_addr) { /* gateway'd */
 	/* find a subnet entry on the same subnet as the gateway */
-	if (subnets == nil 
-	    || [subnets ip:ip SameSupernet:giaddr] == FALSE)
+	if (subnets == NULL) {
 	    return (FALSE);
-	return (TRUE);
+	}
+	return (SubnetListAreAddressesOnSameSupernet(subnets, ip, giaddr));
     }
 
     for (i = 0; i < S_inetroutes->count; i++) {
@@ -1388,11 +1335,15 @@ ip_address_reachable(struct in_addr ip, struct in_addr giaddr,
     return (FALSE);
 }
 
-boolean_t 
+boolean_t
 subnet_match(void * arg, struct in_addr iaddr)
 {
     subnet_match_args_t *	s = (subnet_match_args_t *)arg;
 
+    if (iaddr.s_addr == 0) {
+	/* make sure we never vend 0.0.0.0 */
+	return (FALSE);
+    }
     /* the binding may be invalid for this subnet, but it has one */
     s->has_binding = TRUE;
     if (iaddr.s_addr == s->ciaddr.s_addr
@@ -1412,21 +1363,9 @@ subnet_match(void * arg, struct in_addr iaddr)
 static void
 bootp_request(request_t * request)
 {
-    u_char *		bootfile = NULL;
-    NIDomain_t *	domain = NULL;
-    u_char *		hostname = NULL;
+    char *		bootfile = NULL;
+    char *		hostname = NULL;
     struct in_addr	iaddr;
-    boolean_t		netinfo_host = FALSE;
-    static const u_char	netinfo_options[] = {
-	dhcptag_subnet_mask_e, 
-	dhcptag_router_e, 
-	dhcptag_netinfo_server_address_e,
-	dhcptag_netinfo_server_tag_e,
-	dhcptag_domain_name_server_e,
-	dhcptag_domain_name_e,
-	dhcptag_host_name_e,
-    };
-#define N_NETINFO_OPTIONS (sizeof(netinfo_options) / sizeof(netinfo_options[0]))
     struct bootp 	rp;
     struct bootp *	rq = (struct bootp *)request->pkt;
     u_int16_t		secs;
@@ -1448,42 +1387,39 @@ bootp_request(request_t * request)
 
     if (rq->bp_ciaddr.s_addr == 0) { /* client doesn't specify ip */
 	subnet_match_args_t	match;
-	PLCacheEntry_t * 	entry;
 
 	bzero(&match, sizeof(match));
 	match.if_p = request->if_p;
 	match.giaddr = rq->bp_giaddr;
-	entry = NICache_lookup_hw(&cache, request->time_in_p, 
-				  rq->bp_htype, rq->bp_chaddr, rq->bp_hlen,
-				  subnet_match, &match, &domain, &iaddr);
-	if (entry == NULL) {
-	    return;
+	if (bootp_getbyhw_file(rq->bp_htype, rq->bp_chaddr, rq->bp_hlen,
+			       subnet_match, &match, &iaddr,
+			       &hostname, &bootfile) == FALSE) {
+	    if (use_open_directory == FALSE
+	        || bootp_getbyhw_ds(rq->bp_htype, rq->bp_chaddr, rq->bp_hlen,
+				 subnet_match, &match, &iaddr,
+				 &hostname, &bootfile) == FALSE) {
+		return;
+	    }
 	}
-	host_parms_from_proplist(&entry->pl, 0, NULL, &hostname, &bootfile);
-
 	rp.bp_yiaddr = iaddr;
-	if (S_netinfo_host) {
-	    if (ni_valforprop(&entry->pl, NIPROP_SERVES))
-		netinfo_host = TRUE;
-	}
     }
     else { /* client specified ip address */
-	PLCacheEntry_t * entry;
-	
 	iaddr = rq->bp_ciaddr;
-
-	entry = NICache_lookup_ip(&cache, request->time_in_p, iaddr, &domain);
-	if (entry == NULL)
-	    return;
-	host_parms_from_proplist(&entry->pl, 0, NULL, &hostname, &bootfile);
+	if (bootp_getbyip_file(iaddr, &hostname, &bootfile) == FALSE) {
+	    if (use_open_directory == FALSE
+	        || bootp_getbyip_ds(iaddr, &hostname, &bootfile) == FALSE) {
+		return;
+	    }
+	}
     }
     rq->bp_file[sizeof(rq->bp_file) - 1] = '\0';
     my_log(LOG_INFO,"BOOTP request [%s]: %s requested file '%s'",
 	   if_name(request->if_p), 
-	   hostname ? hostname : (u_char *)inet_ntoa(iaddr),
+	   hostname ? hostname : inet_ntoa(iaddr),
 	   rq->bp_file);
-    if (bootp_add_bootfile(rq->bp_file, hostname, bootfile,
-			   rp.bp_file, sizeof(rp.bp_file)) == FALSE)
+    if (bootp_add_bootfile((const char *)rq->bp_file, hostname, bootfile,
+			   (char *)rp.bp_file,
+			   sizeof(rp.bp_file)) == FALSE)
 	/* client specified a bootfile but it did not exist */
 	goto no_reply;
     
@@ -1494,16 +1430,8 @@ bootp_request(request_t * request)
 	dhcpoa_init(&options, rp.bp_vend + sizeof(rfc_magic),
 		    sizeof(rp.bp_vend) - sizeof(rfc_magic));
 
-	if (netinfo_host) {
-	    my_log(LOG_DEBUG, "netinfo client");
-	    add_subnet_options(domain, hostname, iaddr, 
-			       request->if_p, &options, 
-			       netinfo_options, N_NETINFO_OPTIONS);
-	}
-	else {
-	    add_subnet_options(domain, hostname, iaddr, 
-			       request->if_p, &options, NULL, 0);
-	}
+	add_subnet_options(hostname, iaddr, 
+			   request->if_p, &options, NULL, 0);
 	my_log(LOG_DEBUG, "added vendor extensions");
 	if (dhcpoa_add(&options, dhcptag_end_e, 0, NULL)
 	    != dhcpoa_success_e) {
@@ -1514,16 +1442,16 @@ bootp_request(request_t * request)
     } /* if RFC magic number */
 
     rp.bp_siaddr = if_inet_addr(request->if_p);
-    strcpy(rp.bp_sname, server_name);
+    strcpy((char *)rp.bp_sname, server_name);
     if (sendreply(request->if_p, &rp, sizeof(rp), FALSE, NULL)) {
 	my_log(LOG_INFO, "reply sent %s %s pktsize %d",
 	       hostname, inet_ntoa(iaddr), sizeof(rp));
     }
 
   no_reply:
-    if (hostname)
+    if (hostname != NULL)
 	free(hostname);
-    if (bootfile)
+    if (bootfile != NULL)
 	free(bootfile);
     return;
 }
@@ -1595,45 +1523,6 @@ sendreply(interface_t * if_p, struct bootp * bp, int n,
 }
 
 /*
- * Function: get_dhcp_option
- *
- * Purpose:
- *   Get a dhcp option from subnet description.
- */
-boolean_t
-get_dhcp_option(id subnet, int tag, void * buf, int * len_p)
-{
-    unsigned char	err[256];
-    unsigned char	propname[128];
-    ni_namelist	*	nl_p;
-    const char *	tag_name;
-
-    tag_name = dhcptag_name(tag);
-    if (tag_name == NULL)
-	return (FALSE);
-
-    if (dhcptag_subnet_mask_e == tag)
-	strcpy(propname, NIPROP_NET_MASK);
-    else
-	sprintf(propname, "%s%s", NI_DHCP_OPTION_PREFIX, tag_name);
-
-    nl_p = [subnet lookup:propname];
-    if (nl_p == NULL) {
-	my_log(LOG_DEBUG, "subnet entry %s is missing option %s",
-	       [subnet name:err], propname);
-	return (FALSE);
-    }
-
-    if (dhcptag_from_strlist((unsigned char * *)nl_p->ninl_val,
-			     nl_p->ninl_len, tag, buf, len_p, err) == FALSE) {
-	my_log(LOG_DEBUG, "couldn't add option '%s': %s",
-	       propname, err);
-	return (FALSE);
-    }
-    return (TRUE);
-}
-
-/*
  * Function: add_subnet_options
  *
  * Purpose:
@@ -1641,14 +1530,12 @@ get_dhcp_option(id subnet, int tag, void * buf, int * len_p)
  *   insert them into the message options.
  */
 int
-add_subnet_options(NIDomain_t * domain, u_char * hostname, 
+add_subnet_options(char * hostname, 
 		   struct in_addr iaddr, interface_t * if_p,
-		   dhcpoa_t * options, const u_char * tags, int n)
+		   dhcpoa_t * options, const uint8_t * tags, int n)
 {
     inet_addrinfo_t *	info = if_inet_addr_at(if_p, 0);
-    char		buf[DHCP_OPTION_SIZE_MAX];
-    int			len;
-    static const u_char 	default_tags[] = { 
+    static const uint8_t default_tags[] = { 
 	dhcptag_subnet_mask_e, 
 	dhcptag_router_e, 
 	dhcptag_domain_name_server_e,
@@ -1656,18 +1543,26 @@ add_subnet_options(NIDomain_t * domain, u_char * hostname,
 	dhcptag_host_name_e,
     };
 #define N_DEFAULT_TAGS	(sizeof(default_tags) / sizeof(default_tags[0]))
-    boolean_t		netinfo_done = FALSE;
     int			number_before = dhcpoa_count(options);
     int			i;
-    id			subnet = [subnets entry:iaddr];
+    SubnetRef		subnet = NULL;
 
+    if (subnets != NULL) {
+	/* try to find exact match */
+	subnet = SubnetListGetSubnetForAddress(subnets, iaddr, TRUE);
+	if (subnet == NULL) {
+	    /* settle for inexact match */
+	    subnet = SubnetListGetSubnetForAddress(subnets, iaddr, FALSE);
+	}
+    }
     if (tags == NULL) {
-	tags = (u_char *)default_tags;
+	tags = default_tags;
 	n = N_DEFAULT_TAGS;
     }
 			
     for (i = 0; i < n; i++ ) {
-	len = sizeof(buf);
+	bool		handled = FALSE;
+
 	switch (tags[i]) {
 	  case dhcptag_end_e:
 	  case dhcptag_pad_e:
@@ -1681,7 +1576,6 @@ add_subnet_options(NIDomain_t * domain, u_char * hostname,
 	  case dhcptag_max_dhcp_message_size_e:
 	  case dhcptag_renewal_t1_time_value_e:
 	  case dhcptag_rebinding_t2_time_value_e:
-	  case dhcptag_vendor_class_identifier_e:
 	  case dhcptag_client_identifier_e:
 	      continue; /* ignore these */
 	  default:
@@ -1696,59 +1590,27 @@ add_subnet_options(NIDomain_t * domain, u_char * hostname,
 			   dhcpoa_err(options));
 		}
 	    }
+	    handled = TRUE;
 	}
-	else if (subnet != nil 
-	    && get_dhcp_option(subnet, tags[i], buf, &len)) {
-	    if (dhcpoa_add(options, tags[i], len, buf) 
-		!= dhcpoa_success_e) {
-		my_log(LOG_INFO, "couldn't add option %d: %s",
-		       tags[i], dhcpoa_err(options));
+	else if (subnet != NULL) {
+	    const char *	opt;
+	    int			opt_length;
+
+	    opt = SubnetGetOptionPtrAndLength(subnet, tags[i], &opt_length);
+	    if (opt != NULL) {
+		handled = TRUE;
+		if (dhcpoa_add(options, tags[i], opt_length, opt) 
+		    != dhcpoa_success_e) {
+		    my_log(LOG_INFO, "couldn't add option %d: %s",
+			   tags[i], dhcpoa_err(options));
+		}
 	    }
 	}
-	else { /* try to use defaults if no explicit configuration */
+	if (handled == FALSE) {
+	    /* try to use defaults if no explicit configuration */
 	    struct in_addr * def_route;
 
 	    switch (tags[i]) {
-	      case dhcptag_netinfo_server_tag_e:
-	      case dhcptag_netinfo_server_address_e: {
-		  struct sockaddr_in 	ip;
-		  ni_status		status;
-		  ni_name 		tag;
-
-		  if (netinfo_done)
-		      continue;
-
-		  netinfo_done = TRUE;
-		  if (domain == NULL)
-		      continue;
-		  status = ni_addrtag(NIDomain_handle(domain), &ip, &tag);
-		  if (status != NI_OK)
-		      continue;
-#define LOCAL_NETINFO_TAG	"local"
-		  if (strcmp(tag, LOCAL_NETINFO_TAG) == 0) {
-		      goto netinfo_failed;
-		      /* can't bind to a server's local domain */
-		  }
-
-		  if (dhcpoa_add(options, dhcptag_netinfo_server_address_e,
-				 sizeof(ip.sin_addr), &ip.sin_addr) 
-		      != dhcpoa_success_e) {
-		      my_log(LOG_INFO, 
-			     "couldn't add netinfo server address: %s",
-			     dhcpoa_err(options));
-		      goto netinfo_failed;
-		  }
-		  if (dhcpoa_add(options, dhcptag_netinfo_server_tag_e,
-				 strlen(tag), tag) != dhcpoa_success_e) {
-		      my_log(LOG_INFO, 
-			     "couldn't add netinfo server tag: %s",
-			     dhcpoa_err(options));
-		      goto netinfo_failed;
-		  }
-	      netinfo_failed:
-		  ni_name_free(&tag);
-		  break;
-	      }
 	      case dhcptag_subnet_mask_e: {
 		if (ifl_find_subnet(S_interfaces, iaddr) != if_p)
 		    continue;
@@ -1806,6 +1668,19 @@ add_subnet_options(NIDomain_t * domain, u_char * hostname,
 			my_log(LOG_DEBUG, "default domain name added");
 		}
 		break;
+	      case dhcptag_domain_search_e:
+		if (S_domain_search) {
+		    if (dhcpoa_add(options, dhcptag_domain_search_e,
+				   S_domain_search_size, S_domain_search)
+			!= dhcpoa_success_e) {
+			my_log(LOG_INFO, "couldn't add domain search: %s",
+			       dhcpoa_err(options));
+			continue;
+		    }
+		    if (verbose)
+			my_log(LOG_DEBUG, "domain search added");
+		}
+		break;
 	      default:
 		break;
 	    }
@@ -1837,9 +1712,11 @@ S_init_msg()
 }
 
 static void
-S_relay_packet(struct in_addr * relay, int max_hops, struct bootp * bp, int n, 
-	       interface_t * if_p)
+S_relay_packet(struct bootp * bp, int n, interface_t * if_p)
 {
+    boolean_t	clear_giaddr = FALSE;
+    int		i;
+    boolean_t	printed = FALSE;
     u_int16_t	secs;
 
     if (n < sizeof(struct bootp))
@@ -1847,38 +1724,59 @@ S_relay_packet(struct in_addr * relay, int max_hops, struct bootp * bp, int n,
 
     switch (bp->bp_op) {
     case BOOTREQUEST:
-	if (bp->bp_hops >= max_hops)
+	if (bp->bp_hops >= S_max_hops)
 	    return;
 	secs = (u_int16_t)ntohs(bp->bp_secs);
 	if (secs < reply_threshold_seconds) {
 	    /* don't bother yet */
-	    return;
+	    break;
 	}
 	if (bp->bp_giaddr.s_addr == 0) {
 	    /* fill it in with our interface address */
 	    bp->bp_giaddr = if_inet_addr(if_p);
+	    clear_giaddr = TRUE;
 	}
 	bp->bp_hops++;
-	if (relay->s_addr == if_inet_broadcast(if_p).s_addr)
-	    return; /* don't rebroadcast */
-	if (bootp_transmit(bootp_socket, transmit_buffer, if_name(if_p),
-			   bp->bp_htype, NULL, 0, 
-			   *relay, if_inet_addr(if_p),
-			   S_ipport_server, S_ipport_client,
-			   bp, n) < 0) {
-	    my_log(LOG_INFO, "send failed, %m");
-	    return;
+	for (i = 0; i < S_relay_ip_list_count; i++) {
+	    struct in_addr relay = S_relay_ip_list[i];
+	    if (relay.s_addr == if_inet_broadcast(if_p).s_addr) {
+		continue; /* don't rebroadcast */
+	    }
+	    if (debug && verbose && printed == FALSE) {
+		printed = TRUE;
+		printf("\n=================== Relayed Request ===="
+		       "=================\n");
+		dhcp_print_packet((struct dhcp *)bp, n);
+	    }
+
+	    if (bootp_transmit(bootp_socket, transmit_buffer, if_name(if_p),
+			       bp->bp_htype, NULL, 0, 
+			       relay, if_inet_addr(if_p),
+			       S_ipport_server, S_ipport_client,
+			       bp, n) < 0) {
+		my_log(LOG_INFO, "send to %s failed, %m", inet_ntoa(relay));
+	    }
+	    else {
+		my_log(LOG_INFO,
+		       "Relayed Request [%s] to %s", if_name(if_p),
+		       inet_ntoa(relay));
+	    }
 	}
+	if (clear_giaddr) {
+	    bp->bp_giaddr.s_addr = 0;
+	}
+	bp->bp_hops--;
 	break;
     case BOOTREPLY: {
 	interface_t * 	if_p;
 	struct in_addr	dst;
 
-	if (bp->bp_giaddr.s_addr == 0)
-	    return;
+	if (bp->bp_giaddr.s_addr == 0) {
+	    break;
+	}
 	if_p = ifl_find_ip(S_interfaces, bp->bp_giaddr);
 	if (if_p == NULL) { /* we aren't the gateway - discard */
-	    return;
+	    break;
 	}
 	
 	if ((ntohs(bp->bp_unused) & DHCP_FLAGS_BROADCAST)) {
@@ -1888,33 +1786,30 @@ S_relay_packet(struct in_addr * relay, int max_hops, struct bootp * bp, int n,
 	else {
 	    dst = bp->bp_yiaddr;
 	}
-	if (verbose) {
-	    my_log(LOG_DEBUG, "relaying from server '%s' to %s", 
-		   bp->bp_sname, inet_ntoa(dst));
+	if (debug && verbose) {
+	    if (debug) {
+		printf("\n=================== Relayed Reply ===="
+		       "=================\n");
+		dhcp_print_packet((struct dhcp *)bp, n);
+	    }
 	}
-
 	if (bootp_transmit(bootp_socket, transmit_buffer, if_name(if_p),
 			   bp->bp_htype, bp->bp_chaddr, bp->bp_hlen,
 			   dst, if_inet_addr(if_p),
 			   S_ipport_client, S_ipport_server,
 			   bp, n) < 0) {
-	    my_log(LOG_INFO, "send failed, %m");
-	    return;
+	    my_log(LOG_INFO, "send %s failed, %m", inet_ntoa(dst));
+	}
+	else {
+	    my_log(LOG_INFO, 
+		   "Relayed Response [%s] to %s", if_name(if_p),
+		   inet_ntoa(dst));
 	}
 	break;
     }
 
     default:
 	break;
-    }
-    if (verbose) {
-	struct timeval now;
-	struct timeval result;
-
-	gettimeofday(&now, 0);
-	timeval_subtract(now, S_lastmsgtime, &result);
-	my_log(LOG_INFO, "relay time %d.%06d seconds",
-	       result.tv_sec, result.tv_usec);
     }
     return;
 }
@@ -1954,7 +1849,7 @@ S_dispatch_packet(struct bootp * bp, int n, interface_t * if_p,
 	}
 
 	if (bp->bp_sname[0] != '\0' 
-	    && strcmp(bp->bp_sname, server_name) != 0)
+	    && strcmp((char *)bp->bp_sname, server_name) != 0)
 	    goto request_done;
 
 	if (bp->bp_siaddr.s_addr != 0
@@ -2005,12 +1900,16 @@ S_dispatch_packet(struct bootp * bp, int n, interface_t * if_p,
       }
 
       case BOOTREPLY:
-	/* we're not a relay, sorry */
 	break;
 
       default:
 	break;
     }
+
+    if (S_relay_ip_list != NULL && relay_enabled(if_p)) {
+	S_relay_packet((struct bootp *)S_rxpkt, n, if_p);
+    }
+
     if (verbose || debug) {
 	struct timeval now;
 	struct timeval result;
@@ -2060,7 +1959,7 @@ S_which_interface()
     if_p = ifl_find_name(S_interfaces, ifname);
     if (if_p == NULL) {
 	if (verbose)
-	    my_log(LOG_DEBUG, "unknown interface %s\n", ifname);
+	    my_log(LOG_DEBUG, "unknown interface %s", ifname);
 	return (NULL);
     }
     if (if_inet_valid(if_p) == FALSE)
@@ -2114,9 +2013,8 @@ S_server_loop()
 	    errno = 0;
 	    continue;
 	}
-
 	if (S_sighup) {
-	    static boolean_t first = TRUE;
+	    bootp_readtab(NULL);
 
 	    if (gethostname(server_name, sizeof(server_name) - 1)) {
 		server_name[0] = '\0';
@@ -2126,63 +2024,12 @@ S_server_loop()
 		my_log(LOG_INFO, "server name %s", server_name);
 	    }
 
-	    if (first == FALSE) {
-		S_get_interfaces();
-		S_get_network_routes();
-		S_update_services();
-	    }
-	    first = FALSE;
-
+	    S_get_interfaces();
+	    S_log_interfaces();
+	    S_get_network_routes();
+	    S_update_services();
 	    S_get_dns();
-
-	    { /* get the new subnet descriptions */
-		u_char		err[256];
-		int		i;
-		subnetListNI *	new_subnets = nil;
-
-		if (NIDomainList_count(&niSearchDomains) == 0) {
-		    err[0] = '\0';
-		    if (ni_local != NULL)
-			new_subnets = [[subnetListNI alloc] 
-					  initFromDomain:ni_local Err:err];
-		    if (new_subnets == nil) {
-			my_log(LOG_INFO, 
-			       "subnets init using local domain failed: %s", 
-			       err);
-		    }
-		}
-		else for (i = 0; i < NIDomainList_count(&niSearchDomains); 
-			  i++) {
-		    NIDomain_t * domain;
-
-		    domain = NIDomainList_element(&niSearchDomains, i);
-		    err[0] = '\0';
-		    new_subnets = [[subnetListNI alloc] 
-				      initFromDomain:domain Err:err];
-		    if (new_subnets != nil)
-			break;
-		    my_log(LOG_INFO, 
-			   "subnets init using domain %s failed: %s", 
-			   NIDomain_name(domain), err);
-		}
-
-		if (new_subnets != nil) {
-		    [subnets free];
-		    subnets = new_subnets;
-		    if (debug)
-			[subnets print];
-		}
-	    }
-	    dhcp_init();
-	    if (S_do_netboot || S_do_old_netboot
-		|| S_service_is_enabled(SERVICE_NETBOOT 
-					| SERVICE_OLD_NETBOOT)) {
-		if (bsdp_init() == FALSE) {
-		    my_log(LOG_INFO, "bootpd: NetBoot service turned off");
-		    S_disable_netboot();
-		}
-	    }
-            S_sighup = FALSE;
+	    S_sighup = FALSE;
 	}
 
 	if (n < sizeof(struct dhcp)) {
@@ -2218,56 +2065,6 @@ S_server_loop()
 	sigsetmask(mask);
     }
     return;
-}
-
-/*
- * Function: S_relay_loop
- *
- * Purpose:
- *   Relay appropriate packets.
- */
-static void
-S_relay_loop(struct in_addr * relay, int max_hops)
-{
-    struct in_addr * 	dstaddr_p = NULL;
-    struct sockaddr_in 	from = { sizeof(from), AF_INET };
-    interface_t *	if_p;
-    int 		mask;
-    int			n;
-
-    for (;;) {
-	S_init_msg();
-	msg.msg_name = (caddr_t)&from;
-	msg.msg_namelen = sizeof(from);
-	n = recvmsg(bootp_socket, &msg, 0);
-	if (n < 0) {
-	    my_log(LOG_DEBUG, "recvmsg failed, %m");
-	    errno = 0;
-	    continue;
-	}
-	dstaddr_p = S_which_dstaddr();
-	if (debug) {
-	    if (dstaddr_p == NULL)
-		printf("no destination address\n");
-	    else
-		printf("destination address %s\n", inet_ntoa(*dstaddr_p));
-	}
-
-#if defined(IP_RECVIF)
-	if_p = S_which_interface();
-	if (if_p == NULL) {
-	    continue;
-	}
-#else 
-	if_p = if_first_broadcast_inet(S_interfaces);
-#endif
-
-	gettimeofday(&S_lastmsgtime, 0);
-        mask = sigblock(sigmask(SIGALRM));
-	S_relay_packet(relay, max_hops, (struct bootp *)S_rxpkt, n, if_p);
-	sigsetmask(mask);
-    }
-    exit (0); /* not reached */
 }
 
 #include <SystemConfiguration/SystemConfiguration.h>

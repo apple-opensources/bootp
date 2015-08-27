@@ -72,18 +72,17 @@
 #include "dhcp.h"
 #include "netinfo.h"
 #include "rfc_options.h"
-#import "subnetDescr.h"
+#include "subnets.h"
 #include "interfaces.h"
 #include "bootpd.h"
 #include "bsdpd.h"
 #include "macnc_options.h"
 #include "macNC.h"
 #include "host_identifier.h"
-#include "NICache.h"
 #include "nbsp.h"
 #include "nbimages.h"
-#include "AFPUsers.h"
 #include "NetBootServer.h"
+#include "util.h"
 
 /* 
  * Function: timestamp_syslog
@@ -92,7 +91,7 @@
  *   Log a timestamped event message to the syslog.
  */
 static void
-S_timestamp_syslog(char * msg)
+S_timestamp_syslog(const char * msg)
 {
     static struct timeval	tvp = {0,0};
     struct timeval		tv;
@@ -114,14 +113,14 @@ S_timestamp_syslog(char * msg)
 
 
 static __inline__ void
-S_timestamp(char * msg)
+S_timestamp(const char * msg)
 {
     if (verbose)
 	S_timestamp_syslog(msg);
 }
 
 static boolean_t
-S_set_dimg_ddsk(char * path)
+S_set_dimg_ddsk(const char * path)
 {
     struct attrlist 	attrspec;
     struct {
@@ -142,7 +141,7 @@ S_set_dimg_ddsk(char * path)
 }
 
 static boolean_t
-set_privs_no_stat(u_char * path, struct stat * sb_p, uid_t uid, gid_t gid,
+set_privs_no_stat(const char * path, struct stat * sb_p, uid_t uid, gid_t gid,
 		  mode_t mode, boolean_t unlock)
 {
     boolean_t		needs_chown = FALSE;
@@ -178,7 +177,7 @@ set_privs_no_stat(u_char * path, struct stat * sb_p, uid_t uid, gid_t gid,
 }
 
 boolean_t
-set_privs(u_char * path, struct stat * sb_p, uid_t uid, gid_t gid,
+set_privs(const char * path, struct stat * sb_p, uid_t uid, gid_t gid,
 	  mode_t mode, boolean_t unlock)
 {
     if (stat(path, sb_p) != 0) {
@@ -195,10 +194,10 @@ set_privs(u_char * path, struct stat * sb_p, uid_t uid, gid_t gid,
  *   enclosing directory and the file itself to user/group uid/gid.
  */
 static int
-S_set_uid_gid(u_char * file, uid_t uid, gid_t gid)
+S_set_uid_gid(const char * file, uid_t uid, gid_t gid)
 {
-    u_char 	dir[PATH_MAX];
-    u_char *	last_slash = strrchr(file, '/');
+    char 	dir[PATH_MAX];
+    char *	last_slash = strrchr(file, '/');
 
     if (file[0] != '/' || last_slash == NULL) {
 	if (debug)
@@ -266,8 +265,8 @@ macNC_get_client_info(struct dhcp * pkt, int pkt_size, dhcpol_t * options,
  *   Format a volume pathname given a volume, directory and file name.
  */
 static void
-S_get_volpath(u_char * path, const NBSPEntry * entry, const u_char * dir, 
-	      const u_char * file)
+S_get_volpath(char * path, const NBSPEntry * entry, const char * dir, 
+	      const char * file)
 {
     snprintf(path, PATH_MAX, "%s%s%s%s%s",
 	     entry->path,
@@ -285,9 +284,9 @@ S_get_volpath(u_char * path, const NBSPEntry * entry, const u_char * dir,
  *   Create the given directory path on the given volume.
  */
 static boolean_t
-S_create_volume_dir(NBSPEntry * entry, u_char * dirname, mode_t mode)
+S_create_volume_dir(NBSPEntry * entry, char * dirname, mode_t mode)
 {
-    u_char 		path[PATH_MAX];
+    char 		path[PATH_MAX];
 
     S_get_volpath(path, entry, dirname, NULL);
     if (create_path(path, mode) < 0) {
@@ -322,7 +321,7 @@ set_file_size(int fd, off_t size)
  *   set to type dimg/ddsk.
  */
 static boolean_t
-S_create_shadow_file(u_char * shadow_path, uid_t uid, gid_t gid, 
+S_create_shadow_file(const char * shadow_path, uid_t uid, gid_t gid, 
 		     unsigned long long size, boolean_t set_dimg)
 {
     int 		fd;
@@ -366,13 +365,13 @@ S_create_shadow_file(u_char * shadow_path, uid_t uid, gid_t gid,
 
 static boolean_t
 S_add_afppath_option(struct in_addr servip, dhcpoa_t * options, 
-		     NBSPEntry * entry, u_char * dir, const char * file,
+		     NBSPEntry * entry, const char * dir, const char * file,
 		     int tag)
 {
-    u_char		buf[DHCP_OPTION_SIZE_MAX];
-    u_char		err[256];
+    char		buf[DHCP_OPTION_SIZE_MAX];
+    char		err[256];
     int			len;
-    u_char		path[PATH_MAX];
+    char		path[PATH_MAX];
 
     if (dir && *dir)
 	snprintf(path, sizeof(path), "%s/%s", dir, file);
@@ -404,8 +403,8 @@ S_add_afppath_option(struct in_addr servip, dhcpoa_t * options,
  *   Return the stat structure for the given volume/dir/file.
  */
 static __inline__ int
-S_stat_path_vol_file(u_char * path, NBSPEntry * entry, 
-		     u_char * dir, const char * file,
+S_stat_path_vol_file(char * path, NBSPEntry * entry, 
+		     const char * dir, const char * file,
 		     struct stat * sb_p)
 {
     S_get_volpath(path, entry, dir, file);
@@ -414,7 +413,7 @@ S_stat_path_vol_file(u_char * path, NBSPEntry * entry,
 
 
 static boolean_t
-S_freespace(u_char * path, unsigned long long * size)
+S_freespace(const char * path, unsigned long long * size)
 {
     struct statfs 	fsb;
 
@@ -437,7 +436,7 @@ S_find_volume_with_space(unsigned long long needspace, int def_vol_index,
     unsigned long long	freespace;
     int 		i;
     NBSPEntry *	entry = NULL;
-    u_char		path[PATH_MAX];
+    char		path[PATH_MAX];
     int			vol_index;
 
     for (i = 0, vol_index = def_vol_index; i < NBSPList_count(G_client_sharepoints);
@@ -463,9 +462,9 @@ S_find_volume_with_space(unsigned long long needspace, int def_vol_index,
 }
 
 static boolean_t
-S_remove_shadow(u_char * shadow_path, NBSPEntry * entry, u_char * dir)
+S_remove_shadow(const char * shadow_path, NBSPEntry * entry, const char * dir)
 {
-    u_char path[PATH_MAX];
+    char path[PATH_MAX];
 
     /* remove the shadow file */
     S_set_uid_gid(shadow_path, ROOT_UID, 0);
@@ -473,7 +472,7 @@ S_remove_shadow(u_char * shadow_path, NBSPEntry * entry, u_char * dir)
     S_get_volpath(path, entry, dir, NULL);
     /* and its directory */
     if (rmdir(path)) {
-	u_char new_path[PATH_MAX];
+	char new_path[PATH_MAX];
 	if (debug)
 	    perror(path);
 	S_get_volpath(new_path, entry, "Delete Me", NULL);
@@ -490,10 +489,10 @@ macNC_allocate_shadow(const char * machine_name, int host_number,
 		      uid_t uid, gid_t gid, const char * shadow_name)
 {
     int			def_vol_index;
-    u_char		dir_path[PATH_MAX];
+    char		dir_path[PATH_MAX];
     struct stat		dir_statb;
     int			i;
-    u_char		nc_images_dir[PATH_MAX];
+    char		nc_images_dir[PATH_MAX];
     NBSPEntry *		nc_volume = NULL;
     unsigned long long	needspace;
     char		shadow_path[PATH_MAX];
@@ -631,21 +630,21 @@ static boolean_t
 S_add_image_options(NBImageEntryRef image_entry,
 		    uid_t uid, gid_t gid, struct in_addr servip, 
 		    dhcpoa_t * options, int host_number, 
-		    u_char * afp_hostname)
+		    const char * afp_hostname)
 {
     int			def_vol_index;
-    u_char		dir_path[PATH_MAX];
+    char		dir_path[PATH_MAX];
     struct stat		dir_statb;
     int			i;
-    u_char		nc_images_dir[PATH_MAX];
+    char		nc_images_dir[PATH_MAX];
     NBSPEntry *		nc_volume = NULL;
-    u_char		path[PATH_MAX];
+    char		path[PATH_MAX];
     struct stat		statb;
     int			vol_index;
 
     /* make sure the bootfile exists and the permissions are correct */
     snprintf(path, sizeof(path), "%s/%s/%s",
-	     image_entry->sharepoint.path,
+	     image_entry->sharepoint->path,
 	     image_entry->dir_name,
 	     image_entry->bootfile);
     if (set_privs(path, &statb, ROOT_UID, G_admin_gid,
@@ -730,13 +729,13 @@ S_add_image_options(NBImageEntryRef image_entry,
     }
     else { /* client gets shadow file(s) */
 	unsigned long long	needspace;
-	u_char 			private_path[PATH_MAX];
-	u_char 			shadow_path[PATH_MAX];
-	u_char 			shared_path[PATH_MAX];
+	char 			private_path[PATH_MAX];
+	char 			shadow_path[PATH_MAX];
+	char 			shared_path[PATH_MAX];
 
 	snprintf(shared_path, sizeof(shared_path),
 		 "%s/%s/%s",
-		 image_entry->sharepoint.path,
+		 image_entry->sharepoint->path,
 		 image_entry->dir_name,
 		 image_entry->type_info.classic.shared);
 	/* set the shared system image permissions */
@@ -748,7 +747,7 @@ S_add_image_options(NBImageEntryRef image_entry,
 
 	/* add the shared system image option */
 	if (S_add_afppath_option(servip, options, 
-				 &image_entry->sharepoint,
+				 image_entry->sharepoint,
 				 image_entry->dir_name, 
 				 image_entry->type_info.classic.shared,
 				 macNCtag_shared_system_file_e) == FALSE) {
@@ -758,14 +757,14 @@ S_add_image_options(NBImageEntryRef image_entry,
 	    /* check for the private system image, set its permissions */
 	    snprintf(private_path, sizeof(private_path),
 		     "%s/%s/%s",
-		     image_entry->sharepoint.path,
+		     image_entry->sharepoint->path,
 		     image_entry->dir_name,
 		     image_entry->type_info.classic.private);
 	    if (set_privs(private_path, &statb, ROOT_UID, G_admin_gid,
 			  SHARED_FILE_PERMS, FALSE) == TRUE) {
 		/* add the private image option */
 		if (S_add_afppath_option(servip, options, 
-					 &image_entry->sharepoint,
+					 image_entry->sharepoint,
 					 image_entry->dir_name, 
 					 image_entry->type_info.classic.private,
 					 macNCtag_private_system_file_e) 
@@ -891,9 +890,9 @@ S_add_image_options(NBImageEntryRef image_entry,
 
 boolean_t
 macNC_allocate(NBImageEntryRef image_entry,
-	       struct dhcp * reply, u_char * hostname, struct in_addr servip, 
-	       int host_number, dhcpoa_t * options,
-	       uid_t uid, u_char * afp_user, u_char * passwd)
+	       struct dhcp * reply, const char * hostname, 
+	       struct in_addr servip, int host_number, dhcpoa_t * options,
+	       uid_t uid, const char * afp_user, const char * passwd)
 {
     if (dhcpoa_add(options, macNCtag_user_name_e, strlen(afp_user),
 		   afp_user) != dhcpoa_success_e) {
@@ -911,7 +910,7 @@ macNC_allocate(NBImageEntryRef image_entry,
 	return (FALSE);
     }
     {
-	u_char	buf[16];
+	char	buf[16];
 	int	buf_len = sizeof(buf);
 	
 	if (macNCopt_str_to_type(passwd, macNCtype_afp_password_e,
@@ -933,14 +932,14 @@ macNC_allocate(NBImageEntryRef image_entry,
 }
 
 void
-macNC_unlink_shadow(int host_number, u_char * hostname)
+macNC_unlink_shadow(int host_number, const char * hostname)
 {
     int			def_vol_index;
     int			i;
-    u_char		nc_images_dir[PATH_MAX];
+    char		nc_images_dir[PATH_MAX];
     NBSPEntry *	nc_volume = NULL;
     struct stat		shadow_statb;
-    u_char		shadow_path[PATH_MAX];
+    char		shadow_path[PATH_MAX];
     int			vol_index;
 
     snprintf(nc_images_dir, sizeof(nc_images_dir),

@@ -20,21 +20,22 @@
  * 
  * @APPLE_LICENSE_HEADER_END@
  */
+/*
+ * bootpdfile.h
+ * - routines and variables to parse
+ */
+#ifndef _S_BOOTPDFILE_H
+#define _S_BOOTPDFILE_H
 
-#import <objc/Object.h>
-#import <mach/boolean.h>
-#import <sys/types.h>
+#include "hostlist.h"
 
-#define CLIENT_TYPE_ANY		"any"
-
-@interface clientTypes : Object
-{
-    boolean_t		any;
-    id			types;
-}
-
-- init;
-- addTypes:(const u_char * *)list Count:(int)count;
-- (boolean_t) includesType:(const u_char *)name;
-@end
+void 		bootp_readtab(const char * filename);
+boolean_t 	bootp_getbyhw_file(uint8_t hwtype, void * hwaddr, int hwlen,
+				   subnet_match_func_t * func, void * arg,
+				   struct in_addr * iaddr_p, 
+				   char * * hostname,
+				   char * * bootfile);
+boolean_t       bootp_getbyip_file(struct in_addr ciaddr, char * * hostname, 
+				   char * * bootfile);
+#endif _S_BOOTPDFILE_H
 
